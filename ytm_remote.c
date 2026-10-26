@@ -769,19 +769,15 @@ static void draw_now_playing(Canvas* canvas, App* app) {
     int h = text_top - text_gap - bar_y; /* the bar fills what is left */
     if(h > 0) draw_bar(canvas, 2, bar_y, 124, h, app->pos, app->dur);
 
-    /* The liked heart sits in the middle of the bar. It is punched out of the
-     * bar first (a white box exactly its size) so the black heart reads whether
-     * it lands on the filled or the empty part — the bar is only a few pixels
-     * tall, so a cut-out is the only way to keep both visible. Only "liked"
-     * draws anything: unknown and not-liked leave the bar untouched, so the
-     * screen never claims something the PC cannot see. */
-    if(app->liked != 2 && h >= HEART_H) {
+    /* The heart sits in the middle of the row under the bar — the time row is
+     * empty there (elapsed hard left, total hard right), so it needs no room and
+     * covers nothing. Liked is a heart, not-liked a cracked heart, and an unknown
+     * state draws nothing: the screen never claims something the PC cannot see. */
+    if(app->liked != 2) {
         const uint8_t* icon = app->liked == 1 ? HEART_BITS : HEART_BROKEN;
-        int hx = 2 + (124 - HEART_W) / 2;
-        int hy = bar_y + (h - HEART_H) / 2;
-        canvas_set_color(canvas, ColorWhite);
-        canvas_draw_box(canvas, hx, hy, HEART_W, HEART_H);
-        canvas_set_color(canvas, ColorBlack);
+        int hx = 64 - HEART_W / 2;
+        int hy = bar_y + (h > 0 ? h : 0);          /* first row under the bar */
+        if(hy + HEART_H > 63) hy = 63 - HEART_H;   /* never into the bottom edge */
         canvas_draw_xbm(canvas, hx, hy, HEART_W, HEART_H, icon);
     }
 
