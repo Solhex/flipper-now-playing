@@ -289,9 +289,37 @@ class BrowserLinkTests(unittest.TestCase):
         self.assertTrue(self.link.liked)
         self.assertEqual(self.link.state()["title"], "Song")
 
+    def test_focused_tab_wins_over_a_later_background_one(self):
+        self.post_state({"client": "a", "liked": True, "title": "Tab A",
+                         "focused": True, "visible": True, "lastActive": 1000})
+        self.post_state({"client": "b", "liked": False, "title": "Tab B",
+                         "focused": False, "visible": True, "lastActive": 2000})
+        # B posted last, but A is the tab the user is looking at
+        self.assertEqual(self.link.state()["title"], "Tab A")
+        self.assertEqual(self.link.state()["client"], "a")
+
+    def test_last_active_breaks_the_tie(self):
+        self.post_state({"client": "a", "title": "Old", "focused": False,
+                         "visible": True, "lastActive": 1000})
+        self.post_state({"client": "b", "title": "Recent", "focused": False,
+                         "visible": True, "lastActive": 5000})
+        self.assertEqual(self.link.state()["title"], "Recent")
+
+    def test_toggle_is_aimed_at_the_followed_tab(self):
+        self.post_state({"client": "a", "liked": False, "title": "Tab A",
+                         "focused": True, "visible": True})
+        self.link.request_toggle("Tab A")
+        with urllib.request.urlopen(f"{self.base}/wait", timeout=5) as reply:
+            command = json.load(reply)
+        self.assertEqual(command["cmd"], "toggle")
+        self.assertEqual(command["client"], "a")
+
     def test_state_goes_stale(self):
         self.post_state({"liked": True, "title": "Song"})
-        self.link.updated -= 10
+        self.assertTrue(self.link.fresh())
+        # age the tab's record: freshness is per client, not one global clock
+        for record in self.link.clients.values():
+            record["updated"] -= 10
         self.assertFalse(self.link.fresh())
 
     def test_toggle_is_handed_to_the_next_poll(self):

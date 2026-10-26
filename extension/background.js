@@ -36,7 +36,7 @@ async function postState(payload) {
  * trusting a URL match. Nothing waits on a rejected promise, because an
  * unsettled `sendMessage` inside the poll loop used to stall every later
  * command. */
-function forwardToggle(title) {
+function forwardToggle(title, client) {
   chrome.tabs.query({}).then((tabs) => {
     const ranked = [...tabs].sort((a, b) => {
       const score = (tab) => (tab.audible ? 2 : 0) + (tab.active ? 1 : 0);
@@ -47,7 +47,7 @@ function forwardToggle(title) {
       const tab = ranked[index];
       let sent;
       try {
-        sent = chrome.tabs.sendMessage(tab.id, { type: "toggle", title });
+        sent = chrome.tabs.sendMessage(tab.id, { type: "toggle", title, client });
       } catch (error) {
         tryNext(index + 1);
         return;
@@ -74,7 +74,7 @@ async function pollLoop() {
       });
       const data = await response.json();
       clearTimeout(abort);
-      if (data && data.cmd === "toggle") forwardToggle(data.title);
+      if (data && data.cmd === "toggle") forwardToggle(data.title, data.client);
     } catch (error) {
       await new Promise((resolve) => setTimeout(resolve, RETRY_MS));
     }

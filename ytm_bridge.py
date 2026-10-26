@@ -193,6 +193,11 @@ class BrowserLink:
 
     def __init__(self, port=8765):
         self.port = int(port)
+        # One record per reporting tab. With YouTube Music open in two browsers
+        # (or two tabs) the bridge must follow the one the user is actually
+        # using, not whichever posted last.
+        self.clients = {}
+        self.active_id = None
         self.liked = None
         self.title = ""
         self.artist = ""
@@ -210,42 +215,89 @@ class BrowserLink:
         self.error = ""
 
     # ---- state
-    def update(self, liked, title="", artist="", playing=None):
+    def update(self, liked, title="", artist="", playing=None, client=None,
+               visible=None, focused=None, last_active=None, diag=None):
+        """Record one tab's report and re-pick which tab the bridge follows."""
+        client_id = client or "default"
         with self._lock:
-            changed = liked != self.liked
-            self.liked, self.title, self.artist = liked, title or "", artist or ""
-            self.playing = playing
-            self.updated = time.monotonic()
+            record = self.clients.setdefault(client_id, {})
+            record.update(liked=liked, title=title or "", artist=artist or "",
+                          playing=playing, visible=visible, focused=focused,
+                          lastActive=last_active, diag=diag,
+                          updated=time.monotonic())
             self.requests += 1
+        return self._reselect()
+
+    def _select(self):
+        """The tab to follow: focused and visible first, then most recently used.
+
+        `lastActive` is when the user last touched that tab (click, key, focus);
+        it is what makes "the tab I am looking at" win over a background one that
+        happens to post later.
+        """
+        live = [(client_id, record) for client_id, record in self.clients.items()
+                if record.get("updated") and
+                time.monotonic() - record["updated"] < 6.0]
+        if not live:
+            return None
+
+        def rank(item):
+            record = item[1]
+            return (bool(record.get("focused") and record.get("visible")),
+                    bool(record.get("visible")),
+                    record.get("lastActive") or 0,
+                    record.get("updated") or 0)
+
+        return max(live, key=rank)
+
+    def _reselect(self):
+        with self._lock:
+            chosen = self._select()
+            if chosen is None:
+                return False
+            client_id, record = chosen
+            liked = record.get("liked")
+            changed = liked != self.liked
+            self.active_id = client_id
+            self.liked = liked
+            self.title = record.get("title", "")
+            self.artist = record.get("artist", "")
+            self.playing = record.get("playing")
+            self.updated = record.get("updated", 0.0)
             if changed:
                 self.changes += 1
-        return changed
+            return changed
 
     def fresh(self, max_age=6.0):
-        """True while an extension is reporting (it heartbeats every 2 s)."""
+        """True while at least one tab is reporting (heartbeat every 2 s)."""
         with self._lock:
-            return self.updated and time.monotonic() - self.updated < max_age
+            return self._select() is not None
 
     def state(self):
         with self._lock:
+            record = self.clients.get(self.active_id, {}) if self.active_id else {}
             return {"liked": self.liked, "title": self.title, "artist": self.artist,
                     "playing": self.playing, "reports": self.requests,
-                    "changes": self.changes,
-                    "polls": self.polls, "fresh": bool(self.updated and
-                                                       time.monotonic() - self.updated < 6.0)}
+                    "changes": self.changes, "polls": self.polls,
+                    "clients": len(self.clients), "client": self.active_id,
+                    "focused": record.get("focused"), "visible": record.get("visible"),
+                    "diag": record.get("diag"),
+                    "fresh": self._select() is not None}
 
     # ---- commands
-    def request_toggle(self, title=""):
+    def request_toggle(self, title="", client=None):
         if self.remote_base:
             try:
                 request = urllib.request.Request(
                     f"{self.remote_base}/toggle",
-                    data=json.dumps({"title": title}).encode(), method="POST")
+                    data=json.dumps({"title": title, "client": client}).encode(),
+                    method="POST")
                 urllib.request.urlopen(request, timeout=5).read()
             except Exception as exc:
                 print("  toggle: could not reach the running bridge:", exc)
             return
-        self._commands.put({"cmd": "toggle", "title": title})
+        self._commands.put({"cmd": "toggle", "title": title,
+                            "client": client or self.active_id})
 
     def _answers(self):
         try:
@@ -262,13 +314,16 @@ class BrowserLink:
                 with urllib.request.urlopen(f"{self.remote_base}/state", timeout=3) as reply:
                     data = json.load(reply)
                 if data.get("fresh"):
+                    # Go through update() so the mirrored value becomes a client
+                    # record like any other; fresh() and the selection logic both
+                    # work off records, not off bare attributes.
+                    self.update(data.get("liked"), data.get("title", ""),
+                                data.get("artist", ""), data.get("playing"),
+                                client=data.get("client") or "remote",
+                                visible=data.get("visible"),
+                                focused=data.get("focused"))
                     with self._lock:
-                        self.liked = data.get("liked")
-                        self.title = data.get("title", "")
-                        self.artist = data.get("artist", "")
-                        self.playing = data.get("playing")
-                        self.changes = data.get("changes", self.changes)
-                        self.updated = time.monotonic()
+                        self.changes = max(self.changes, data.get("changes") or 0)
             except Exception:
                 pass
             time.sleep(1.0)
@@ -302,12 +357,14 @@ class BrowserLink:
                 if self.path.startswith("/toggle"):
                     # Test hook: the same command the Flipper's like button sends,
                     # so the round trip can be checked with curl and no hardware.
-                    title = ""
+                    title = client = ""
                     try:
-                        title = (json.loads(body or b"{}") or {}).get("title", "")
+                        payload = json.loads(body or b"{}") or {}
+                        title = payload.get("title", "")
+                        client = payload.get("client") or (link.active_id or "")
                     except ValueError:
                         pass
-                    link.request_toggle(title)
+                    link.request_toggle(title, client)
                     self._reply(200, b'{"queued":"toggle"}')
                     return
                 try:
@@ -315,11 +372,14 @@ class BrowserLink:
                 except ValueError:
                     self._reply(400)
                     return
-                changed = link.update(data.get("liked"), data.get("title", ""),
-                                      data.get("artist", ""), data.get("playing"))
+                changed = link.update(
+                    data.get("liked"), data.get("title", ""), data.get("artist", ""),
+                    data.get("playing"), client=data.get("client"),
+                    visible=data.get("visible"), focused=data.get("focused"),
+                    last_active=data.get("lastActive"), diag=data.get("diag"))
                 if changed:
-                    print(f"  <- browser: liked={link.liked} "
-                          f"({link.title[:30]!r})")
+                    print(f"  <- browser: liked={link.liked} ({link.title[:30]!r}) "
+                          f"[{link.active_id}{', focused' if data.get('focused') else ''}]")
                 self._reply(200, b'{"ok":true}')
 
             def do_GET(self):
@@ -399,7 +459,7 @@ class BrowserLink:
         self._server = None
 
 
-def link_toggle(link, title="", timeout=2.5, attempts=2):
+def link_toggle(link, title="", timeout=2.5, attempts=2, client=None):
     """Ask the extension to press like; returns the new state, or None.
 
     Waits for the *like state* to move, not for any report: the page heartbeats
@@ -415,7 +475,7 @@ def link_toggle(link, title="", timeout=2.5, attempts=2):
         return None
     for _ in range(max(1, attempts)):
         before = link.changes
-        link.request_toggle(title)
+        link.request_toggle(title, client)
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             time.sleep(0.05)
@@ -1621,6 +1681,11 @@ if IS_WINDOWS:
                 # (and on Chromium it cannot work at all): say what happened
                 # instead of pointing at a tab that is already open.
                 return False, "Browser did not click", None
+            if self.link is not None and self.link.polls > 0:
+                # The worker is polling, so the extension is installed — but no
+                # tab is reporting, which means its content script is not in the
+                # open page (reloading an extension does not re-inject).
+                return False, "Reload the YT Music tab", None
 
             if self._debug is not None:
                 state = self._debug.toggle(self._title)
