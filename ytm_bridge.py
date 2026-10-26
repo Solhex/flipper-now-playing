@@ -27,6 +27,7 @@ import argparse
 import atexit
 import asyncio
 import concurrent.futures
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
 import json
 import os
@@ -69,6 +70,7 @@ ART_RETRY_S = 0.4      # Windows: cover re-read interval while a track settles
 ART_RECHECK_S = 5.0    # Windows: cover re-read interval once settled, if still missing
 LIKE_REFRESH_S = 1.0   # how often the like button is re-read (one localhost round trip)
 LIKE_PORT = 9222       # Firefox --remote-debugging-port default
+EXTENSION_PORT = 8765  # localhost port the browser extension posts the like state to
 
 FRAME_META, FRAME_ART, FRAME_VOL, FRAME_TOAST, FRAME_LIKE = 0x01, 0x02, 0x03, 0x04, 0x05
 LIKE_NO, LIKE_YES, LIKE_UNKNOWN = 0, 1, 2
@@ -161,6 +163,172 @@ def pct(fraction):
         return max(0, min(100, int(round(float(fraction) * 100))))
     except (TypeError, ValueError):
         return None
+
+
+# ============================================ like state (browser extension)
+class BrowserLink:
+    """The little localhost server the browser extension talks to.
+
+    Only the page knows whether the current track is liked, and asking it through
+    an extension is the least fragile way: unlike the debug port it does not care
+    how the browser was started, the same code runs in Chrome, Edge and Firefox,
+    and it also lets the bridge press the real button instead of typing a
+    shortcut at a window.
+
+    Two directions, both over plain HTTP on the loopback interface:
+
+        POST /state   extension -> bridge, whenever the like button changes
+                      (and every couple of seconds as a heartbeat)
+        GET  /wait    extension long-polls; the bridge answers with a command
+                      ("toggle") when the Flipper's like button is pressed
+
+    Long-polling instead of a websocket keeps this to the standard library and
+    survives the extension being suspended and restarted.
+    """
+
+    def __init__(self, port=8765):
+        self.port = int(port)
+        self.liked = None
+        self.title = ""
+        self.artist = ""
+        self.playing = None
+        self.updated = 0.0          # monotonic, when /state last arrived
+        self.requests = 0           # how many reports arrived since start
+        self.polls = 0              # long-poll requests: proof the extension listens
+        self._commands = queue.Queue()
+        self._lock = threading.Lock()
+        self._server = None
+        self._thread = None
+        self.error = ""
+
+    # ---- state
+    def update(self, liked, title="", artist="", playing=None):
+        with self._lock:
+            changed = liked != self.liked
+            self.liked, self.title, self.artist = liked, title or "", artist or ""
+            self.playing = playing
+            self.updated = time.monotonic()
+            self.requests += 1
+        return changed
+
+    def fresh(self, max_age=6.0):
+        """True while an extension is reporting (it heartbeats every 2 s)."""
+        with self._lock:
+            return self.updated and time.monotonic() - self.updated < max_age
+
+    def state(self):
+        with self._lock:
+            return {"liked": self.liked, "title": self.title, "artist": self.artist,
+                    "playing": self.playing, "reports": self.requests,
+                    "polls": self.polls, "fresh": bool(self.updated and
+                                                       time.monotonic() - self.updated < 6.0)}
+
+    # ---- commands
+    def request_toggle(self):
+        self._commands.put({"cmd": "toggle"})
+
+    # ---- server
+    def start(self):
+        if self._server is not None:
+            return True
+        link = self
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.0"
+
+            def _reply(self, code, payload=b"{}", timeout=0):
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Access-Control-Allow-Origin", "*")
+                self.send_header("Access-Control-Allow-Headers", "Content-Type")
+                # Chrome asks before a public page may reach a private address
+                self.send_header("Access-Control-Allow-Private-Network", "true")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def do_OPTIONS(self):
+                self._reply(204, b"")
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or 0)
+                body = self.rfile.read(length) if length else b"{}"
+                if self.path.startswith("/toggle"):
+                    # Test hook: the same command the Flipper's like button sends,
+                    # so the round trip can be checked with curl and no hardware.
+                    link.request_toggle()
+                    self._reply(200, b'{"queued":"toggle"}')
+                    return
+                try:
+                    data = json.loads(body or b"{}")
+                except ValueError:
+                    self._reply(400)
+                    return
+                changed = link.update(data.get("liked"), data.get("title", ""),
+                                      data.get("artist", ""), data.get("playing"))
+                if changed:
+                    print(f"  <- browser: liked={link.liked} "
+                          f"({link.title[:30]!r})")
+                self._reply(200, b'{"ok":true}')
+
+            def do_GET(self):
+                if self.path.startswith("/wait"):
+                    with link._lock:
+                        link.polls += 1
+                    started = time.monotonic()
+                    try:
+                        command = link._commands.get(timeout=20)
+                    except queue.Empty:
+                        command = {"cmd": None}
+                    if command.get("cmd"):
+                        print(f"  <- extension picked up "
+                              f"{command['cmd']} after {time.monotonic() - started:.1f}s")
+                    self._reply(200, json.dumps(command).encode())
+                else:
+                    self._reply(200, json.dumps(link.state()).encode())
+
+            def log_message(self, format, *args):
+                pass                        # a poll every second is not news
+
+        try:
+            server = ThreadingHTTPServer(("127.0.0.1", self.port), Handler)
+        except OSError as exc:
+            self.error = str(exc)
+            print(f"Browser extension bridge unavailable on port {self.port}: {exc}")
+            return False
+        server.daemon_threads = True
+        self._server = server
+        self._thread = threading.Thread(target=server.serve_forever, daemon=True,
+                                        name="ytm-browser-link")
+        self._thread.start()
+        return True
+
+    def close(self):
+        if self._server is not None:
+            try:
+                self._server.shutdown()
+                self._server.server_close()
+            except Exception:
+                pass
+        self._server = None
+
+
+def link_toggle(link, timeout=3.0):
+    """Ask the extension to press like; returns the new state, or None.
+
+    None means "no extension is reporting", not "failed": the caller then falls
+    back to the debug port or to typing at the window.
+    """
+    if link is None or not link.fresh():
+        return None
+    before = link.updated
+    link.request_toggle()
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        time.sleep(0.05)
+        if link.updated != before:      # the page reported back
+            return link.liked
+    return None
 
 
 # =================================================== like state (Firefox BiDi)
@@ -367,8 +535,9 @@ class MprisBackend:
     name = "mpris"
     seek_step = SEEK_STEP
 
-    def __init__(self, player=None):
+    def __init__(self, player=None, link=None):
         self.player = player
+        self.link = link
 
     # ---- helpers shared with the old module-level API
     def run_playerctl(self, *args):
@@ -390,7 +559,8 @@ class MprisBackend:
         return [p for p in out.stdout.splitlines() if p.strip()]
 
     def close(self):
-        pass
+        if self.link is not None:
+            self.link.close()
 
     async def read(self):
         """Return dict(title, artist, art, playing, pos, dur, url, vol) or None.
@@ -439,7 +609,9 @@ class MprisBackend:
             "url": (f["xesam:url"] or "").strip(),
             "vol": pct(f["volume"]),
             "app": self.player or "",
-            "liked": None,      # MPRIS has no like state; the Windows backend reads it
+            # MPRIS carries no like state: the browser extension or the Firefox
+            # debug port is what knows it.
+            "liked": self.link.liked if (self.link and self.link.fresh()) else None,
         }
 
     async def command(self, ch):
@@ -468,6 +640,10 @@ class MprisBackend:
         that is what gets checked: firing the keystroke blind would type a '+'
         into whatever else happened to have focus.
         """
+        state = link_toggle(self.link)
+        if state is not None:
+            return True, ("Liked" if state else "Unlike toggled")
+
         vkkey = Path.home() / ".local/share/ytm-remote/bin/vkkey"
         if not vkkey.exists():
             return False, "Like: vkkey missing"
@@ -887,7 +1063,8 @@ if IS_WINDOWS:
         name = "smtc"
         seek_step = SEEK_STEP_WIN
 
-        def __init__(self, hint=None, firefox_port=None):
+        def __init__(self, hint=None, firefox_port=None, link=None):
+            self.link = link
             from winrt.windows.media.control import (
                 GlobalSystemMediaTransportControlsSessionManager as Manager,
                 GlobalSystemMediaTransportControlsSessionPlaybackStatus as Status,
@@ -1084,7 +1261,8 @@ if IS_WINDOWS:
                 "url": "",
                 "vol": self._volume_level(),
                 "app": self.label(session),
-                "liked": await self._liked_state(title),
+                "liked": self.link.liked if (self.link and self.link.fresh())
+                         else await self._liked_state(title),
             }
 
         async def _liked_state(self, title):
@@ -1159,9 +1337,11 @@ if IS_WINDOWS:
             return int(raw), dur
 
         def close(self):
-            """Release the debug session; the BLE link is closed by the caller."""
+            """Release the debug session and the extension port."""
             if self._debug is not None:
                 self._debug.end()
+            if self.link is not None:
+                self.link.close()
 
         def _pid_for(self, session):
             row = self.window_for(getattr(session, "source_app_user_model_id", "") or "")
@@ -1304,6 +1484,11 @@ if IS_WINDOWS:
             works while the bridge is in the background — the keystroke path can
             only type at a focused window.
             """
+            state = link_toggle(self.link)
+            if state is not None:
+                self._liked, self._liked_at = state, 0.0
+                return True, ("Liked" if state else "Unlike toggled")
+
             if self._debug is not None:
                 state = self._debug.toggle(self._title)
                 if state is not None:
@@ -1967,17 +2152,23 @@ async def dump_once(bridge, wait=12.0):
 
 async def main_async(args):
     firefox_port = getattr(args, "firefox_port", LIKE_PORT) or None
+    link = None
+    ext_port = getattr(args, "ext_port", EXTENSION_PORT)
+    if ext_port:
+        link = BrowserLink(ext_port)
+        if not link.start():
+            link = None
 
     if args.list:
         if IS_WINDOWS:
-            backend = WindowsBackend(args.player, firefox_port)
+            backend = WindowsBackend(args.player, firefox_port, link)
             rows = await backend.list()
             if not rows:
                 print("No media sessions — start playback in Firefox/YouTube Music first.")
             for row in rows:
                 print(row)
             return 0
-        mpris = MprisBackend(args.player)
+        mpris = MprisBackend(args.player, link)
         for player in mpris.list():
             print(player)
         return 0
@@ -1991,11 +2182,11 @@ async def main_async(args):
         return 0
 
     if IS_WINDOWS:
-        backend = WindowsBackend(args.player, firefox_port)
+        backend = WindowsBackend(args.player, firefox_port, link)
     else:
         player = args.player
         if not player:
-            mpris = MprisBackend(None)
+            mpris = MprisBackend(None, link)
             players = mpris.list()
             waited = getattr(args, "wait_for_player", False)
             while not players and waited:
@@ -2006,7 +2197,7 @@ async def main_async(args):
                 sys.exit("No MPRIS players found — start YouTube Music / a video first.")
             player = players[0]
             print("Using player:", player)
-        backend = MprisBackend(player)
+        backend = MprisBackend(player, link)
 
     if args.cmd:
         if args.cmd not in ("p", "n", "b", "-", "+", "u", "d", "l"):
@@ -2083,6 +2274,9 @@ def main():
     ap.add_argument("--pair", action="store_true",
                     help="pair with the Flipper and exit (Windows: pair once before first use)")
     ap.add_argument("--address", help="connect to this BLE address instead of scanning")
+    ap.add_argument("--ext-port", type=int, default=EXTENSION_PORT, metavar="PORT",
+                    help="localhost port the browser extension talks to "
+                         f"(default {EXTENSION_PORT}, 0 = off)")
     ap.add_argument("--firefox-port", type=int, default=LIKE_PORT, metavar="PORT",
                     help="Firefox --remote-debugging-port used to read (and toggle) the "
                          f"YouTube Music like button (default {LIKE_PORT}, 0 = off)")

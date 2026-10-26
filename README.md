@@ -214,7 +214,41 @@ right after the track changed.
 
 The track screen draws a small heart after the elapsed time when the current
 track is liked. Nothing in MPRIS or the Windows media session exposes that — only
-the page knows — so the bridge asks the page, through Firefox's remote agent:
+the page knows — so the bridge asks the page. There are two ways to ask it, and
+the bridge uses whichever is available:
+
+### 1. The browser extension (Chrome, Edge, Firefox)
+
+`extension/` is a Manifest V3 add-on. It reads the like button the site itself
+draws and reports it to the bridge on `127.0.0.1:8765`; when the Flipper's like
+button is held, the bridge answers the extension's long poll and the extension
+**clicks the real button**. No browser launch flags, no debug port, and the same
+folder runs in every Chromium browser.
+
+- **Chrome / Edge**: `chrome://extensions` -> Developer mode -> *Load unpacked* ->
+  pick the `extension` folder.
+- **Firefox**: `about:debugging#/runtime/this-firefox` -> *Load Temporary
+  Add-on* -> pick `extension/manifest.json`. Firefox only keeps temporary add-ons
+  for the session unless the file is signed, so for a permanent setup either sign
+  it or use option 2 below.
+
+Check it with the bridge's own endpoints:
+
+```bash
+curl -s 127.0.0.1:8765/state     # liked / title / reports / polls / fresh
+curl -s -X POST 127.0.0.1:8765/toggle    # what holding OK sends the page
+```
+
+`extension/test/` holds the harness used to verify this: a mock page with the
+site's like-button DOM, and a script that loads the extension into a headless
+Chromium browser and drives the bridge
+(`python extension/test/run_extension_test.py 50`).
+
+### 2. Firefox's own debug port
+
+Without the extension, Firefox started with `--remote-debugging-port` serves a
+WebDriver BiDi agent, and the same state is read (and the button clicked) over
+that:
 
 ```bat
 .venv\Scripts\python windows_startup.py firefox   :: Desktop shortcut with the debug port
@@ -224,7 +258,8 @@ Firefox must be **started** with `--remote-debugging-port=9222` (the port belong
 to whichever instance of a profile starts first, so quit Firefox fully before
 using that shortcut). The bridge then reads the like button's `aria-pressed` once
 a second and presses the same button when you hold OK, which is why the heart
-follows your own clicks in the browser too.
+follows your own clicks in the browser too. `--ext-port 0` and
+`--firefox-port 0` switch each source off.
 
 Things worth knowing:
 
