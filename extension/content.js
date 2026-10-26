@@ -12,6 +12,13 @@
 (() => {
   "use strict";
 
+  /* The worker re-injects this file into tabs that were open before the
+   * extension was reloaded (a reload does not re-inject content scripts, which
+   * is why "connected but nothing works" kept happening). Running twice would
+   * register two listeners and click twice, so refuse the second run. */
+  if (window.__ytmBridgeLoaded) return;
+  window.__ytmBridgeLoaded = true;
+
   const LIKE = "ytmusic-like-button-renderer #button-shape-like button";
   const HEARTBEAT_MS = 2000;
   const ACTIVITY_REPORT_MS = 500;

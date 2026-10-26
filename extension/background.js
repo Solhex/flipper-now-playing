@@ -45,6 +45,31 @@ async function postState(payload) {
  * trusting a URL match. Nothing waits on a rejected promise, because an
  * unsettled `sendMessage` inside the poll loop used to stall every later
  * command. */
+/* Tabs opened before the extension was reloaded have no content script, so the
+ * worker puts it there itself: one injection per tab, and content.js refuses to
+ * run twice. */
+const injectedTabs = new Set();
+
+async function ensureScript(tabId) {
+  if (injectedTabs.has(tabId)) return false;
+  try {
+    await chrome.scripting.executeScript({ target: { tabId }, files: ["content.js"] });
+    injectedTabs.add(tabId);
+    return true;
+  } catch (error) {
+    return false;      // closed tab, or a page we are not allowed to touch
+  }
+}
+
+async function sweepTabs() {
+  try {
+    const tabs = await chrome.tabs.query({ url: ["https://music.youtube.com/*"] });
+    for (const tab of tabs) {
+      if (!tab.discarded) ensureScript(tab.id);
+    }
+  } catch (error) { /* no tabs permission for a URL match: ignore */ }
+}
+
 function forwardToggle(title, client) {
   chrome.tabs.query({}).then((tabs) => {
     const ranked = [...tabs].sort((a, b) => {
@@ -62,7 +87,16 @@ function forwardToggle(title, client) {
         return;
       }
       if (sent && typeof sent.then === "function") {
-        sent.then(() => {}).catch(() => tryNext(index + 1));
+        sent.then(() => {}).catch(async () => {
+          // No listener in this tab: it probably predates the extension reload.
+          if (await ensureScript(tab.id)) {
+            try {
+              await chrome.tabs.sendMessage(tab.id, { type: "toggle", title, client });
+              return;
+            } catch (error) { /* fall through to the next tab */ }
+          }
+          tryNext(index + 1);
+        });
       }
     };
     tryNext(0);
@@ -72,6 +106,7 @@ function forwardToggle(title, client) {
 async function pollLoop() {
   if (polling) return;
   polling = true;
+  sweepTabs();
   while (true) {
     try {
       // A hung request must not stop the loop for good: abort it and retry.
