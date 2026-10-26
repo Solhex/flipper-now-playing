@@ -753,6 +753,21 @@ static void draw_now_playing(Canvas* canvas, App* app) {
     int h = text_top - text_gap - bar_y; /* the bar fills what is left */
     if(h > 0) draw_bar(canvas, 2, bar_y, 124, h, app->pos, app->dur);
 
+    /* The liked heart sits in the middle of the bar. It is punched out of the
+     * bar first (a white box exactly its size) so the black heart reads whether
+     * it lands on the filled or the empty part — the bar is only a few pixels
+     * tall, so a cut-out is the only way to keep both visible. Only "liked"
+     * draws anything: unknown and not-liked leave the bar untouched, so the
+     * screen never claims something the PC cannot see. */
+    if(app->liked == 1 && h >= HEART_H) {
+        int hx = 2 + (124 - HEART_W) / 2;
+        int hy = bar_y + (h - HEART_H) / 2;
+        canvas_set_color(canvas, ColorWhite);
+        canvas_draw_box(canvas, hx, hy, HEART_W, HEART_H);
+        canvas_set_color(canvas, ColorBlack);
+        canvas_draw_xbm(canvas, hx, hy, HEART_W, HEART_H, HEART_BITS);
+    }
+
     char elapsed[12], total[12];
     fmt_time(elapsed, sizeof(elapsed), app->pos);
     /* An unknown length is not 0:00 — say so rather than display a wrong time. */
@@ -763,13 +778,6 @@ static void draw_now_playing(Canvas* canvas, App* app) {
     }
     canvas_draw_str(canvas, 2, 63, elapsed);
     canvas_draw_str_aligned(canvas, 126, 63, AlignRight, AlignBottom, total);
-
-    /* A small heart after the elapsed time when the track is liked. Only the
-     * "liked" state draws anything: unknown and not-liked both leave the row as
-     * it was, so the screen never claims something the PC cannot see. */
-    if(app->liked == 1) {
-        canvas_draw_xbm(canvas, 36, 57, HEART_W, HEART_H, HEART_BITS);
-    }
 }
 
 /* The key-bind reference, opened from the settings menu. Terse on purpose: the
