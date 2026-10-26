@@ -1,11 +1,17 @@
-/* Talks to the bridge on 127.0.0.1.
+/* Relays between the YouTube Music tabs, the Flipper link page (remote.html)
+ * and — only when the extension page says it is not holding the Bluetooth link
+ * itself — the old loopback bridge.
  *
- * The work sits here rather than in the content script so the requests come from
- * the extension's own origin: page CSP and Chrome's public-to-private rules then
- * cannot block the loopback call.
+ * The work sits here rather than in the content script so requests come from the
+ * extension's own origin: page CSP and Chrome's public-to-private rules then
+ * cannot block a loopback call.
  *
- *   POST /state  — the page's like state, whenever it changes
- *   GET  /wait   — long poll; answers {"cmd": "toggle"} when the Flipper asks
+ *   content -> "state"   the page's like/now-playing state, whenever it changes
+ *   remote  <- "state"   the same state, pushed at the Flipper link page
+ *   remote  -> "cmd"     a button on the Flipper (or "like"), run on the page
+ *
+ * Loopback (GET /wait, POST /state) stays for Firefox, which has no Web
+ * Bluetooth: there the Python bridge still drives the device.
  */
 
 const BRIDGE = "http://127.0.0.1:8765";
@@ -20,8 +26,13 @@ const BROWSER_NAME = /firefox/i.test(navigator.userAgent) ? "firefox" : "chromiu
 const WHO = `worker=${WORKER}&browser=${BROWSER_NAME}`;
 const RETRY_MS = 2000;
 
-/* Service workers are stopped when idle, so the poll loop must be restartable
- * and must never keep a stale flag saying it is already running. */
+/* "bluetooth" = the extension page holds the Flipper link itself (no companion
+ * app). "bridge" = fall back to the loopback poll. Only the link page knows,
+ * because only a document has navigator.bluetooth. */
+let mode = "bridge";
+
+const remotePorts = new Set();
+
 let polling = false;
 
 async function postState(payload) {
@@ -36,24 +47,9 @@ async function postState(payload) {
   }
 }
 
-/* Exactly one tab gets the toggle: two YouTube Music tabs both clicking would
- * like and then unlike in the same breath, so the state would never change.
- *
- * Tabs are tried in order of likely relevance (audible first, then the active
- * one) and the first one that accepts the message wins — a tab without the
- * content script rejects it, which is how the right tab is found without
- * trusting a URL match. Nothing waits on a rejected promise, because an
- * unsettled `sendMessage` inside the poll loop used to stall every later
- * command. */
-/* Tabs opened before the extension was reloaded have no content script, so the
- * worker puts it there itself: one injection per tab, and content.js refuses to
- * run twice. */
+/* Exactly one tab gets a toggle: two YouTube Music tabs both clicking would
+ * like and then unlike in the same breath, so the state would never change. */
 const injectedTabs = new Set();
-
-/* Which tab each reporting client lives in. The bridge cannot press a key at a
- * background tab (the keystroke would go to whatever tab is in front), so on
- * request the extension brings the YouTube Music tab forward, holds it there long
- * enough for the bridge's Enter, and puts the previous tab back. */
 const clientTabs = new Map();
 let restoreTab = null;
 
@@ -110,18 +106,22 @@ async function sweepTabs() {
   } catch (error) { /* no tabs permission for a URL match: ignore */ }
 }
 
-function forwardToggle(title, client) {
-  chrome.tabs.query({}).then((tabs) => {
-    const ranked = [...tabs].sort((a, b) => {
+function rankedTabs() {
+  return chrome.tabs.query({}).then((tabs) =>
+    [...tabs].sort((a, b) => {
       const score = (tab) => (tab.audible ? 2 : 0) + (tab.active ? 1 : 0);
       return score(b) - score(a);
-    });
+    }));
+}
+
+function forwardMessage(message) {
+  rankedTabs().then((ranked) => {
     const tryNext = (index) => {
       if (index >= ranked.length) return;
       const tab = ranked[index];
       let sent;
       try {
-        sent = chrome.tabs.sendMessage(tab.id, { type: "toggle", title, client });
+        sent = chrome.tabs.sendMessage(tab.id, message);
       } catch (error) {
         tryNext(index + 1);
         return;
@@ -131,7 +131,7 @@ function forwardToggle(title, client) {
           // No listener in this tab: it probably predates the extension reload.
           if (await ensureScript(tab.id)) {
             try {
-              await chrome.tabs.sendMessage(tab.id, { type: "toggle", title, client });
+              await chrome.tabs.sendMessage(tab.id, message);
               return;
             } catch (error) { /* fall through to the next tab */ }
           }
@@ -143,11 +143,45 @@ function forwardToggle(title, client) {
   }).catch(() => {});
 }
 
+function forwardToggle(title, client) {
+  forwardMessage({ type: "toggle", title, client });
+}
+
+/* A Flipper button: "like" keeps the existing toggle path (it knows how to land
+ * a click), everything else is a transport action handled by the page. */
+function handleRemoteCommand(cmd, title, client) {
+  if (cmd === "like") forwardToggle(title, client);
+  else forwardMessage({ type: "cmd", cmd, client });
+}
+
+function broadcast(payload) {
+  for (const port of remotePorts) {
+    try { port.postMessage({ type: "state", payload }); } catch (error) { /* gone */ }
+  }
+}
+
+/* The link page connects here and stays connected: it is the only context that
+ * can hold a Web Bluetooth connection. */
+chrome.runtime.onConnect.addListener((port) => {
+  if (!port || port.name !== "remote") return;
+  remotePorts.add(port);
+  port.onMessage.addListener((message) => {
+    if (!message) return;
+    if (message.type === "mode") {
+      mode = message.mode === "bluetooth" ? "bluetooth" : "bridge";
+      if (mode === "bridge") pollLoop();
+    } else if (message.type === "cmd") {
+      handleRemoteCommand(message.cmd, message.title, message.client);
+    }
+  });
+  port.onDisconnect.addListener(() => remotePorts.delete(port));
+});
+
 async function pollLoop() {
   if (polling) return;
   polling = true;
   sweepTabs();
-  while (true) {
+  while (mode === "bridge") {
     try {
       // A hung request must not stop the loop for good: abort it and retry.
       const controller = new AbortController();
@@ -165,14 +199,39 @@ async function pollLoop() {
       await new Promise((resolve) => setTimeout(resolve, RETRY_MS));
     }
   }
+  polling = false;
 }
 
 chrome.runtime.onMessage.addListener((message, sender) => {
   if (!message || message.type !== "state") return;
   rememberTab(message.payload && message.payload.client, sender);
-  postState(message.payload);
+  broadcast(message.payload);                    // to the Flipper link page
+  if (mode === "bridge") postState(message.payload);
   pollLoop();
 });
+
+/* The toolbar button opens (or focuses) the Flipper link page. Its tab id is
+ * kept in storage so no "tabs" permission is needed to find it again, and it is
+ * marked non-discardable: Chromium must not throw away the tab that owns the
+ * Bluetooth connection. */
+const REMOTE_TAB_KEY = "remoteTabId";
+
+async function openRemoteTab() {
+  const url = chrome.runtime.getURL("remote.html");
+  const stored = await chrome.storage.local.get(REMOTE_TAB_KEY);
+  const id = stored[REMOTE_TAB_KEY];
+  if (id !== undefined) {
+    try {
+      await chrome.tabs.update(id, { active: true, autoDiscardable: false });
+      return;
+    } catch (error) { /* the tab was closed: open a fresh one */ }
+  }
+  const tab = await chrome.tabs.create({ url, pinned: false });
+  await chrome.storage.local.set({ [REMOTE_TAB_KEY]: tab.id });
+  try { await chrome.tabs.update(tab.id, { autoDiscardable: false }); } catch (error) { /* older browser */ }
+}
+
+chrome.action.onClicked.addListener(openRemoteTab);
 
 chrome.runtime.onStartup.addListener(pollLoop);
 chrome.runtime.onInstalled.addListener(pollLoop);

@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Flipper YT Music Remote</title>
+<style>
+  body { font: 14px system-ui, sans-serif; margin: 0; padding: 24px;
+         background: #12100e; color: #f2e8e4; }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  .sub { color: #a99; margin-bottom: 18px; }
+  button { font: inherit; padding: 8px 16px; margin-right: 8px; border-radius: 6px;
+           border: 1px solid #555; background: #221; color: #f2e8e4; cursor: pointer; }
+  button:hover { background: #332; }
+  #status { display: inline-block; margin-left: 8px; padding: 4px 10px;
+            border-radius: 6px; background: #622; color: #fdd; }
+  #status.ok { background: #262; color: #dfd; }
+  #track { font-size: 16px; margin-top: 18px; }
+  #meta { color: #cbb; margin-top: 4px; font-variant-numeric: tabular-nums; }
+  pre { margin-top: 20px; padding: 12px; height: 220px; overflow: auto;
+        background: #0b0a09; border: 1px solid #333; border-radius: 6px;
+        color: #b9a; font-size: 12px; white-space: pre-wrap; }
+  .note { color: #987; font-size: 12px; margin-top: 6px; }
+</style>
+</head>
+<body>
+  <h1>Flipper YT Music Remote</h1>
+  <div class="sub">No companion app needed — this page talks to the Flipper over Bluetooth.</div>
+
+  <button id="connect">Connect Flipper</button>
+  <button id="disconnect">Disconnect</button>
+  <span id="status">Not connected</span>
+
+  <div id="track">—</div>
+  <div id="meta"></div>
+  <div class="note">Play something on YouTube Music in another tab. Keep this tab open
+    (pinned is fine) — the Bluetooth connection lives here.</div>
+
+  <pre id="log"></pre>
+
+  <script src="remote.js"></script>
+</body>
+</html>

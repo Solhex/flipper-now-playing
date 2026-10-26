@@ -68,6 +68,36 @@
     return video ? !video.paused && !video.ended : null;
   };
 
+  const videoEl = () => document.querySelector("video");
+
+  /* The cover the player is showing. Media Session metadata names the track's own
+   * artwork; the player-bar image is the fallback for the moments before the
+   * metadata lands. The host page cannot read the pixels (cross-origin taint),
+   * so only the URL travels — the extension page fetches and downsizes it. */
+  const artworkUrl = () => {
+    const meta = navigator.mediaSession && navigator.mediaSession.metadata;
+    const art = meta && meta.artwork;
+    if (art && art.length) {
+      const best = art[art.length - 1];
+      if (best && best.src) return best.src;
+    }
+    const img = document.querySelector("ytmusic-player-bar img") ||
+      document.querySelector("ytmusic-player-bar .thumbnail img");
+    return img ? (img.currentSrc || img.src || "") : "";
+  };
+
+  /* Position/length/volume come straight off the media element — better than any
+   * desktop API, which is why this runs here rather than on the PC. */
+  const progress = () => {
+    const v = videoEl();
+    if (!v) return { pos: 0, dur: 0, vol: 100 };
+    return {
+      pos: isFinite(v.currentTime) ? Math.floor(v.currentTime) : 0,
+      dur: isFinite(v.duration) ? Math.floor(v.duration) : 0,
+      vol: Math.round((isFinite(v.volume) ? v.volume : 1) * 100),
+    };
+  };
+
   function payload() {
     const info = trackInfo();
     return {
@@ -76,6 +106,8 @@
       title: info.title,
       artist: info.artist,
       playing: isPlaying(),
+      art: artworkUrl(),
+      ...progress(),
       visible: document.visibilityState === "visible",
       focused: document.hasFocus(),
       lastActive,
@@ -157,6 +189,60 @@
     const theirs = String(wanted).trim().toLowerCase().slice(0, 24);
     return !mine || !theirs || mine === theirs;
   };
+
+  /* ---------------------------------------------------------------- transport
+   * The Flipper's own buttons land here: the extension is now self-contained, so
+   * playback is driven by the site's real controls rather than a desktop hook.
+   * Every control is pressed with the same pointer sequence as the like button,
+   * because a bare .click() is discarded by the page (verified on Brave). */
+  const PLAY_PAUSE = "#play-pause-button, .play-pause-button, tp-yt-paper-icon-button.play-pause-button";
+  const NEXT_BTN = "#next-button, .next-button";
+  const PREV_BTN = "#previous-button, .previous-button";
+
+  function press(el) {
+    const box = el.getBoundingClientRect();
+    const x = Math.round(box.left + box.width / 2);
+    const y = Math.round(box.top + box.height / 2);
+    const opts = { bubbles: true, cancelable: true, composed: true, view: window,
+                   clientX: x, clientY: y, button: 0, buttons: 1, pointerId: 1,
+                   pointerType: "mouse", isPrimary: true };
+    const seq = [["pointerdown", PointerEvent], ["mousedown", MouseEvent],
+                 ["pointerup", PointerEvent], ["mouseup", MouseEvent],
+                 ["click", MouseEvent]];
+    for (const [type, Kind] of seq) {
+      try {
+        el.dispatchEvent(new Kind(type, type === "click" ? { ...opts, buttons: 0 } : opts));
+      } catch (e) { /* element may reject a synthetic event */ }
+    }
+  }
+
+  function act(kind) {
+    const v = videoEl();
+    switch (kind) {
+      case "playpause": {
+        const b = document.querySelector(PLAY_PAUSE);
+        if (b) press(b);
+        else if (v) (v.paused ? v.play() : v.pause());
+        break;
+      }
+      case "next": { const b = document.querySelector(NEXT_BTN); if (b) press(b); break; }
+      case "prev": { const b = document.querySelector(PREV_BTN); if (b) press(b); break; }
+      case "seekback": if (v && isFinite(v.currentTime)) v.currentTime = Math.max(0, v.currentTime - 10); break;
+      case "seekfwd": if (v && isFinite(v.duration)) v.currentTime = Math.min(v.duration, v.currentTime + 10); break;
+      case "volup": if (v) v.volume = Math.min(1, v.volume + 0.05); break;
+      case "voldown": if (v) v.volume = Math.max(0, v.volume - 0.05); break;
+      default: break;
+    }
+    setTimeout(() => report(true), 250);   // the new state goes out at once
+  }
+
+  /* Transport commands from the Flipper (the like button keeps using the
+   * existing "toggle" path, which already knows how to land a click). */
+  chrome.runtime.onMessage.addListener((message) => {
+    if (!message || message.type !== "cmd") return;
+    if (message.client && message.client !== CLIENT) return;
+    act(message.cmd);
+  });
 
   /* The bridge aims a toggle at one tab (message.client); a tab that is not that
    * one stays out of the way, so two browsers cannot fight over the same click.

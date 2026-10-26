@@ -10,6 +10,42 @@ two exchange raw byte frames.
 
     PC (ytm_bridge.py)  <-- BLE serial -->  Flipper (ytm_remote.fap)
 
+## Two ways to drive it
+
+| Host | What the user installs | Browsers / OS |
+|------|------------------------|---------------|
+| **Browser extension** (recommended) | just the add-on — **no companion app, nothing to run** | Chrome, Edge, Brave (any Chromium) |
+| Python bridge (`ytm_bridge.py`) | Python + `bleak`/`pillow`, kept running as a service | Linux, Windows, and Firefox |
+
+The extension is self-contained: it holds the Bluetooth link **itself**, using
+Web Bluetooth, and reads title, artist, cover art, progress and the like state
+straight out of the YouTube Music page. The Flipper keeps running the same
+`.fap`; the wire format is byte-identical, so the device does not care which host
+is on the other end.
+
+```
+YouTube Music tab (content script)  <->  extension worker  <->  remote.html (Web Bluetooth)  <-- BLE -->  Flipper
+```
+
+**Install and run (Chromium):**
+
+1. `chrome://extensions` (or `brave://extensions`) -> Developer mode -> **Load
+   unpacked** -> `extension/dist/chrome` (or the `extension/` folder).
+2. Click the toolbar icon once — the **Flipper YT Music Remote** tab opens.
+3. Press **Connect Flipper**, pick your Flipper in the browser's device chooser,
+   and confirm the pairing code that appears on its screen. Keep that tab open
+   (pinning it is fine): the Bluetooth connection is bound to that document.
+
+`navigator.bluetooth` only exists in a document, so the link lives in that tab —
+a service worker cannot hold it. Chromium remembers the permission, so the page
+reconnects on its own afterwards.
+
+**Firefox** has no Web Bluetooth, so it uses the Python bridge exactly as
+before; the extension then just reports the like state over
+`127.0.0.1:8765`. (Building it strips the `bluetooth` permission for the Firefox
+package so there is no "unknown permission" warning.)
+
+
 ## Files
 
 | File             | Role                                                      |

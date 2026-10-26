@@ -20,7 +20,9 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 DIST = HERE / "dist"
-SHARED = ("content.js", "background.js")
+# remote.html/remote.js are the Web Bluetooth link page: a document is the only
+# context that can hold the GATT connection, so it ships with every target.
+SHARED = ("content.js", "background.js", "remote.html", "remote.js")
 ICONS = "icons"
 
 
@@ -29,6 +31,10 @@ def build_manifest(base, target):
 
     if target == "firefox":
         manifest["background"] = {"scripts": ["background.js"]}
+        # Firefox has no Web Bluetooth: the permission would only produce an
+        # "unknown permission" warning, and the loopback bridge is the path there.
+        manifest["permissions"] = [p for p in manifest.get("permissions", [])
+                                   if p != "bluetooth"]
         manifest.setdefault("browser_specific_settings", {}).setdefault(
             "gecko", {}).update({
                 "id": "ytm-bridge@solhex.local",

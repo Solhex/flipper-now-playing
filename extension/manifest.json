@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Flipper YT Music Remote",
-  "version": "1.0.0",
-  "description": "Tells the local bridge whether the current YouTube Music track is liked, and presses like when the Flipper asks.",
+  "version": "2.0.0",
+  "description": "Show YouTube Music's now-playing on a Flipper Zero and control playback — no companion app to install.",
   "homepage_url": "https://github.com/Solhex/flipper-now-playing",
   "author": "Solhex",
   "icons": {
@@ -12,14 +12,19 @@
     "96": "icons/icon-96.png",
     "128": "icons/icon-128.png"
   },
-  "permissions": ["alarms", "scripting"],
+  "permissions": ["alarms", "scripting", "storage", "bluetooth"],
   "host_permissions": [
     "https://music.youtube.com/*",
+    "https://*.ytimg.com/*",
+    "https://*.googleusercontent.com/*",
     "http://127.0.0.1:8765/*"
   ],
   "background": {
     "service_worker": "background.js",
     "scripts": ["background.js"]
+  },
+  "action": {
+    "default_title": "Flipper YT Music Remote"
   },
   "content_scripts": [
     {
