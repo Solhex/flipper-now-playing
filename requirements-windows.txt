@@ -1,0 +1,12 @@
+# Windows extras on top of requirements.txt:
+#   py -3 -m venv .venv
+#   .venv\Scripts\pip install -r requirements-windows.txt
+-r requirements.txt
+
+# Windows media sessions (the volume flyout / media keys): title, artist,
+# playback state and cover art.
+winrt-Windows.Media.Control>=3.0
+winrt-Windows.Storage.Streams>=3.0
+
+# Per-app volume through Core Audio — the Windows mixer's slider.
+pycaw>=20240210

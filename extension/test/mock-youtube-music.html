@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Mock Track</title>
+  <style>body { font: 14px sans-serif; padding: 20px }</style>
+</head>
+<body>
+  <h1>Mock YouTube Music</h1>
+  <p>Stand-in page for the extension test: the same DOM the real site uses for
+     the like button, and a click handler that flips <code>aria-pressed</code>.</p>
+
+  <ytmusic-like-button-renderer>
+    <div id="like-button">
+      <div id="button-shape-like">
+        <button type="button" aria-pressed="false" aria-label="Like">&#9829; Like</button>
+      </div>
+    </div>
+    <div id="button-shape-dislike">
+      <button type="button" aria-pressed="false" aria-label="Dislike">&#9829;&#824; Dislike</button>
+    </div>
+  </ytmusic-like-button-renderer>
+
+  <p id="log"></p>
+
+  <script>
+    const button = document.querySelector("#button-shape-like button");
+    const log = document.getElementById("log");
+    button.addEventListener("click", () => {
+      const now = button.getAttribute("aria-pressed") === "true" ? "false" : "true";
+      button.setAttribute("aria-pressed", now);
+      log.textContent = `clicked -> aria-pressed=${now}`;
+      /* Deliberately does NOT change document.title: the real site's media-session
+       * title stays the same when you like a track, and the extension matches a
+       * toggle command against that title. */
+    });
+    log.textContent = `ready, aria-pressed=${button.getAttribute("aria-pressed")}`;
+  </script>
+</body>
+</html>

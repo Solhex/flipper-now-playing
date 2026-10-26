@@ -16,7 +16,11 @@ two exchange raw byte frames.
 |------------------|-----------------------------------------------------------|
 | `ytm_remote.c`   | Flipper app: parses frames, draws screen, sends commands  |
 | `application.fam`| Manifest (`requires=["bt"]`, category `Bluetooth`)        |
-| `ytm_bridge.py`  | PC side: MPRIS metadata -> BLE, commands -> `playerctl`   |
+| `ytm_bridge.py`  | PC side: media session -> BLE, buttons -> the player       |
+| `windows_startup.py` | Windows: registers the bridge to start at logon        |
+| `extension/`     | browser add-on: like state -> bridge, bridge -> click  |
+| `extension/build.py` | packages it for Firefox (.xpi) and Chromium (.zip) |
+| `tests/`         | unit tests: frames, art, clock, MPRIS parsing, protocol |
 
 ## Build and flash
 
@@ -47,6 +51,58 @@ Requires `bleak` and `pillow` (`pip install bleak pillow`) and `playerctl`.
 On the Flipper: launch **YT Music Remote** (Apps -> Bluetooth) and make sure
 Bluetooth is ON.
 
+### Windows
+
+The Flipper app is the same build. The PC side reads Windows' own media session —
+the one behind the volume flyout and the media keys — instead of MPRIS, so
+Firefox and YouTube Music behave the way they do on Linux.
+
+```bat
+py -3 -m venv .venv
+.venv\Scripts\pip install -r requirements-windows.txt
+.venv\Scripts\python ytm_bridge.py --list     :: what Windows is playing right now
+.venv\Scripts\python ytm_bridge.py --dump     :: the exact numbers that would go to the Flipper
+.venv\Scripts\python ytm_bridge.py --pair     :: pair the Flipper once (Windows needs a bond)
+.venv\Scripts\python ytm_bridge.py --name Gumi --player firefox
+.venv\Scripts\python ytm_bridge.py --dump --firefox-port 0   :: skip the like state
+```
+
+`--firefox-port` (default 9222, `0` turns it off) is where the like state comes
+from — see [Liked state](#liked-state-the-heart).
+
+`--dump` and `--cmd` (one button, e.g. `--cmd p`) need no Flipper, which is the
+quickest way to tell a bridge problem from a device problem. Load the browser
+extension (below) to get the like state on any browser.
+launch **YT Music Remote** (Apps -> Bluetooth), Bluetooth ON.
+
+The pieces differ underneath:
+
+| | Linux | Windows |
+|---|---|---|
+| media source | MPRIS via `playerctl` | Windows media sessions (WinRT / SMTC) |
+| extra dependencies | `playerctl`, `yt-dlp` | `winrt-Windows.Media.Control`, `pycaw`, `yt-dlp` |
+| play / pause / skip | `playerctl` | `WM_APPCOMMAND` posted at the browser window |
+| volume | the player's own volume | that app's slider in the Windows mixer |
+| pairing | BlueZ bond | `--pair` once, or Settings -> Bluetooth |
+
+Firefox is why two of those rows exist. It publishes a Windows media session, so
+title, artist and cover art arrive for free — but it ignores the session's
+play/pause/next methods (they return "ok" and do nothing), so the bridge posts the
+same `WM_APPCOMMAND` messages the media keys produce directly to the browser
+window, which it does act on. It also reports no playback position for YouTube
+Music, and its timeline can still carry the *previous* track's length, so the
+bridge times the track itself (as on Linux) and only trusts a timeline once it has
+seen the position move. Length still comes from `yt-dlp`, so without it the total
+and the progress bar stay empty.
+
+Two Windows-only consequences worth knowing:
+
+- **Seek is ±10 s per press on every platform.** Firefox has no seek API at all,
+  so it types YouTube Music's own `l`/`h` shortcuts, and those step 10 s — which
+  is why the device advertises 10 s rather than a step Windows cannot honour.
+- **Volume keys move that app's slider**, not a player-internal volume, and need
+  `pycaw`; without it they are ignored (`Volume keys disabled` on startup).
+
 ## Track screen
 
 Cover art on the left, then title, artist, play state, a progress bar and the
@@ -66,8 +122,8 @@ An unknown track length shows as `--:--` rather than a wrong `0:00`.
 | OK (hold)     | like / unlike the track    |
 | Up            | tap: volume up · hold (~0.3 s): next track      |
 | Down          | tap: volume down · hold (~0.3 s): previous track |
-| Left          | seek back 5 s              |
-| Right         | seek forward 5 s           |
+| Left          | seek back 10 s             |
+| Right         | seek forward 10 s          |
 | Back (short)  | settings menu              |
 | Back (long)   | exit the app               |
 
@@ -123,6 +179,27 @@ The unit lives at `~/.config/systemd/user/ytm-remote.service` and runs the bridg
 from a dedicated venv at `~/.local/share/ytm-remote/venv`, so it doesn't depend on
 any other Python install on the machine.
 
+On Windows the same idea is one command — it writes a shortcut into your Startup
+folder, so the bridge comes up at logon with no console window and no
+administrator rights:
+
+```bat
+.venv\Scripts\python windows_startup.py install --name Gumi
+.venv\Scripts\python windows_startup.py status        :: what it runs, and the log tail
+.venv\Scripts\python windows_startup.py uninstall
+```
+
+The shortcut runs `pythonw.exe`, so nothing appears on screen; the bridge appends
+its usual lines to `%LOCALAPPDATA%\ytm-remote\bridge.log` (that is what
+`--log` is for — `pythonw.exe` has no stdout at all), and keeps
+`status.json` beside it. Extra bridge options go through
+`--args "--player firefox --hz 15"`.
+
+There is no stale-link step on Windows — the BLE stack releases the link with the
+process — so the bridge just rescans, then retries the cached address. If it
+starts before the Bluetooth radio is up it says so and retries, rather than
+exiting.
+
 ## Settings menu (Back)
 
 | Row       | Controls                                              |
@@ -138,10 +215,139 @@ and then repeats every 150 ms, so after a hold the app ignores Up/Down for 1.5 s
 (`SONG_COOLDOWN_MS`) — otherwise the trailing repeats would nudge the volume
 right after the track changed.
 
+## Liked state (the heart)
+
+The track screen draws a small heart in the middle of the progress bar when the
+current track is liked, and a cracked heart when it is not; an unknown state draws
+nothing. Holding OK shows `Liked` / `Unliked` with the matching icon beside it.
+Nothing in MPRIS or the Windows media session exposes that — only
+the page knows — so the bridge asks the page. There are two ways to ask it, and
+the bridge uses whichever is available:
+
+### 1. The browser extension (Chrome, Edge, Firefox)
+
+`extension/` is a Manifest V3 add-on. It reads the like button the site itself
+draws and reports it to the bridge on `127.0.0.1:8765`; when the Flipper's like
+button is held, the bridge answers the extension's long poll and the extension
+**clicks the real button**. No browser launch flags, no debug port, and the same
+folder runs in every Chromium browser.
+
+Packaging it is one command — one source, two manifests, because Chrome and
+Firefox disagree about how a Manifest V3 background script is declared:
+
+```bash
+python extension/build.py
+#   extension/dist/ytm-bridge-1.0.0-firefox.xpi   (+ unpacked in dist/firefox)
+#   extension/dist/ytm-bridge-1.0.0-chrome.zip    (+ unpacked in dist/chrome)
+```
+
+- **Chrome / Edge / Brave**: `chrome://extensions` (or `brave://extensions`) ->
+  Developer mode -> *Load unpacked* -> `extension/dist/chrome` (or the `extension`
+  folder itself, which is what the tests use).
+- **Firefox, temporary**: `about:debugging#/runtime/this-firefox` -> *Load
+  Temporary Add-on* -> `extension/dist/firefox/manifest.json`. Firefox drops it
+  when the browser closes.
+- **Firefox, permanent**: the `.xpi` has to be signed. Either submit it on
+  addons.mozilla.org, or sign it in one step from your own account (the keys are
+  your credentials — export them, never paste them anywhere):
+
+  ```bash
+  export AMO_JWT_ISSUER=...   AMO_JWT_SECRET=...
+  npx web-ext sign --source-dir extension/dist/firefox \
+      --api-key "$AMO_JWT_ISSUER" --api-secret "$AMO_JWT_SECRET" --channel unlisted
+  ```
+
+  then `about:addons` -> gear -> *Install Add-on From File…*. `npx web-ext lint
+  --source-dir extension/dist/firefox` reports 0 errors (one warning: the add-on
+  is declared desktop-only, because there is no bridge on Android to talk to).
+
+Check it with the bridge's own endpoints:
+
+```bash
+curl -s 127.0.0.1:8765/state     # liked / title / reports / polls / fresh
+curl -s -X POST 127.0.0.1:8765/toggle    # what holding OK sends the page
+```
+
+`--dump` and `--cmd` work while the bridge is running: when port 8765 is already
+owned they read the state from the running bridge instead of starting a second
+server, and say so (`Using the running bridge on port 8765 for the like state`).
+The state is labelled `(browser extension)` in `--dump` when that is where it came
+from.
+
+`extension/test/` holds the harness used to verify this: a mock page with the
+site's like-button DOM, and a script that loads the extension (working copy or a
+packaged build) into a headless Chromium browser and drives it:
+
+```bash
+python extension/test/run_extension_test.py 40 extension/dist/chrome
+YTM_TEST_BROWSER="C:/Program Files/BraveSoftware/Brave-Browser/Application/brave.exe" \
+    python extension/test/run_extension_test.py
+```
+
+It starts its **own** bridge on a free port and re-points the copied extension at
+it, so your real bridge, your browser and your music are untouched. It prints
+PASS when the extension reported the mock track and a toggle round-trip liked and
+unliked it. Verified against Brave, Edge and Firefox.
+
+`link_toggle` retries once when no state change comes back: a freshly started
+service worker has not attached its content script yet, so the first command can
+land on nobody. A heartbeat never counts as a result — it only watches the
+`liked` value move.
+
+### 2. Firefox's own debug port
+
+Without the extension, Firefox started with `--remote-debugging-port` serves a
+WebDriver BiDi agent, and the same state is read (and the button clicked) over
+that:
+
+```bat
+.venv\Scripts\python windows_startup.py firefox   :: Desktop shortcut with the debug port
+```
+
+Firefox must be **started** with `--remote-debugging-port=9222` (the port belongs
+to whichever instance of a profile starts first, so quit Firefox fully before
+using that shortcut). The bridge then reads the like button's `aria-pressed` once
+a second and presses the same button when you hold OK, which is why the heart
+follows your own clicks in the browser too. `--ext-port 0` and
+`--firefox-port 0` switch each source off.
+
+Things worth knowing:
+
+- **No port, no heart.** Without the debug port the bridge says
+  `like state: unavailable (...)` and sends "unknown", which draws nothing —
+  better a blank than a wrong heart.
+- Firefox allows **one** debug session at a time. The running bridge holds it, so
+  `--dump`/`--cmd` cannot open a second one; they say so and fall back to the
+  keystroke path for like. A client that dies without ending its session leaves
+  the port unusable until Firefox restarts (the bridge keeps retrying).
+- Firefox speaks **WebDriver BiDi**, not Chrome's CDP: `/json/list` answers 404
+  and the websocket *is* the `/session` handshake endpoint. `websocket-client` is
+  the only extra dependency.
+
 ## Like (hold OK)
 
-MPRIS has no like action, so this types YouTube Music's own shortcut (`shift+=`)
-at the browser. That has consequences worth knowing:
+Neither MPRIS nor the Windows media session has a like action, so this presses
+YouTube Music's own like button in the page — the extension clicks it, and on
+Chromium a trusted keystroke finishes the job (see below). Consequences worth
+knowing:
+
+- **Chromium throws away untrusted events.** On Brave/Chrome/Edge a synthetic
+  `button.click()` lands exactly on the right element (proven: the message
+  arrives, the button is found, nothing covers it, it is not disabled) and
+  `aria-pressed` does not move, because the page ignores events that did not come
+  from the user. Firefox accepts the same click. So when the page reports a click
+  that changed nothing, it leaves the like button **focused**, and the bridge
+  presses a real **Enter** at the browser window — trusted input, which a focused
+  button treats as a click. Measured round trip on Brave: **1.4 s**.
+- **If the tab is behind another tab**, a keystroke would land in whatever tab is
+  in front. The extension then brings the YouTube Music tab forward, holds it for
+  the Enter, and puts the previous tab back afterwards. It only does this after
+  the page has confirmed the tab is not focused, and it never types blind.
+- **Two tabs or two browsers can both report.** Each tab sends a client id,
+  `focused`/`visible` and a `lastActive` stamp that moves on any click, key or
+  scroll, and the bridge follows the tab you last used: focused first, then most
+  recent activity. A like is addressed to that client and every other tab ignores
+  it.
 
 - **The YouTube Music tab has to be the one on screen.** A window's title is its
   active tab's title, so the bridge looks for a window named "… - YouTube Music",
@@ -149,13 +355,18 @@ at the browser. That has consequences worth knowing:
   matches it does *nothing* and says so — firing blind would type a `+` into
   whatever else you have focused. Either way the device shows a toast with the
   result (`Like toggled` / `Open the YT Music tab`).
-- It needs `swaymsg` to check the focused window, and **`vkkey`** to type: a small
+- On Windows the same keystroke is sent with `SendInput` after raising the
+  browser window, and focus goes back to what you were using afterwards.
+- On Linux it needs `swaymsg` to check the focused window, and **`vkkey`** to type: a small
   Wayland virtual-keyboard client at `~/.local/share/ytm-remote/bin/vkkey`, built
   from `src/vkkey.c` in that directory against `wayland-client` + `xkbcommon`
   (rebuild with `wayland-scanner` + `gcc`, no root needed). It uses
   `zwp_virtual_keyboard_manager_v1` — what sway advertises here — and sets the
   shift modifier through the protocol's `modifiers` request, because pressing the
   shift keycode does not work.
+- The browser extension described under [Liked state](#liked-state-the-heart)
+  works the same on Linux: it is the only route that does not depend on the
+  window manager (`swaymsg`) or on typing at a window.
 - Check the toast path without touching the buttons:
   `python3 ytm_bridge.py --name Gumi --toast "hello"` (needs the service stopped,
   since only one connection can hold the device).
@@ -195,6 +406,9 @@ advertise notify — yields a link where metadata flows but buttons appear dead.
                which is what keeps the per-tick frame inside one BLE write.
       0x02 ART : [w:1][h:1][1-bit rows, (w+7)/8 per row, LSB-first per byte]
       0x03 VOL : [volume:1]  percent, 0..100 — shows the volume overlay
+      0x04 TOAST: [icon:1][text utf8] — a moment-long line; icon 0 none,
+               1 heart, 2 broken heart (the LCD font has no heart glyph)
+      0x05 LIKE: [state:1]   0 = not liked, 1 = liked, 2 = unknown
 
 Flipper -> PC: a single command byte (`p` `n` `b` `-` `+` `u` `d`; `u`/`d` are
 the volume keys). Unknown frame types and oversized payloads are dropped and the
@@ -217,10 +431,45 @@ redrawing the screen.
 - **First write fails with `0x0E Unlikely Error`.** The serial profile is still
   coming up; the bridge retries with backoff and settles.
 - **Wrong BLE name.** Pass `--name <substring>` or set `FLIPPER_NAME`.
+- **`Bluetooth unavailable: Bluetooth radio is not powered on`.** Windows has the
+  radio switched off (or a bridge started before the adapter came up). The bridge
+  retries every few seconds; nothing else to do.
+- **The Flipper is listed but connecting fails on Windows.** The serial profile
+  expects a bonded device: run `ytm_bridge.py --pair` once, or pair it in
+  Settings -> Bluetooth. `--pair` also works on Linux.
+- **Windows: volume keys do nothing.** `pycaw` is not installed, or that app has
+  no audio session yet (nothing has played since it started). Chromium browsers
+  play audio from a *different process* than the one owning the window (Brave's
+  window was pid 1384 while its audio session was 7988), so the bridge matches
+  the process name as well as the pid and prefers a session that is playing.
+- **Extension reloaded and nothing works.** Reloading an unpacked extension
+  strips its content script from every open tab, and nothing puts it back. The
+  worker now re-injects `content.js` into any YouTube Music tab that has no
+  listener (at startup and when a toggle finds nobody home), and `content.js`
+  refuses to run twice so a double injection cannot click twice. If a like still
+  says `Reload the YT Music tab`, the worker is polling but no tab ever reported:
+  reload the tab once, then check that the page is really `music.youtube.com`.
+- **A like says `Browser did not click`.** The page was reached and its own click
+  did nothing. The report carries the reason in `diag.click` (`button`,
+  `renderers`, `covered`, `disabled`, `tag`, `ok`, `buttonFocused`,
+  `windowFocused`) — read it with `curl -s 127.0.0.1:8765/state`, it distinguishes
+  "no content script", "no like button" and "the click was refused".
+- **Windows: a terminal window flashes while music plays.** That was the
+  `yt-dlp` length lookup: `pythonw.exe` has no console, so a console child gets a
+  new one, i.e. a window. The bridge now starts it with `CREATE_NO_WINDOW`; if a
+  terminal still flashes, the child holding it is whatever replaced `yt-dlp`.
+- **Windows: nothing happens after logging in.** `windows_startup.py status`
+  prints the exact command and the end of `bridge.log`; a bridge that was started
+  hidden is otherwise invisible. If the log is empty, the shortcut's `pythonw.exe`
+  path moved (reinstall after recreating the venv).
 - **Buttons do nothing while metadata streams fine.** Check the
   `Connected. write=… notify=…` line: `notify` must be `…228e61fe0000`
   (the indicate-only TX char). Pointing it at the flow-control char `…228e63…`
   is silent but harmless-looking, which is exactly how it hid for a while.
+- **Build fails with `__pycache__/...pyc: file format not recognized`.** `scons`
+  links every file it finds beside the sources, so a stray `.pyc` (say, from
+  running `python -m py_compile` in the project folder) is handed to the linker.
+  Delete `__pycache__` and build again.
 - **`ufbt launch` says `Application "YT Music Remote" has to be closed
   manually`.** The firmware refuses to close a running app over RPC or the CLI:
   press Back on the Flipper (long-press with this build), then launch again.
@@ -249,6 +498,37 @@ python3 ~/.local/share/ytm-remote/check_time.py --watch 20 # watch both clocks m
 It prints the track, the art age, the length, what the Flipper is being fed and
 the drift, then a verdict: `MATCH` within 2s, otherwise which way it is off (and
 that only means anything while playing — the art file keeps ageing while paused).
+
+## Tests
+
+`tests/test_bridge.py` pins the parts that are awkward to exercise by hand: the
+wire format (parsed back byte by byte the way the device does), the XBM bit
+polarity and row padding, the elapsed-time clock, MPRIS metadata parsing (fed
+canned `playerctl` output, so the Linux side is covered on any machine), and the
+extension's localhost protocol.
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+Nothing there needs a Flipper, a browser or a media player.
+
+## Building the app on Windows
+
+`ufbt` needs the ARM toolchain (~1.3 GB) and the SDK; both live outside the repo:
+
+```bat
+py -3 -m venv .buildenv
+.buildenv\Scripts\pip install ufbt
+set UFBT_HOME=D:\ufbt          :: only if the system drive is short on space
+.buildenv\Scripts\python -m ufbt           :: -> dist\ytm_remote.fap
+.buildenv\Scripts\python -m ufbt launch    :: upload + run (needs the app closed)
+```
+
+`ufbt launch` uploads the FAP but cannot stop a running app — the firmware only
+allows that by hand — so the last step is Back on the device and reopening the
+app. Run `python -m py_compile` somewhere outside the project folder: a stray
+`__pycache__` in it is handed to the linker and fails the build.
 
 ## Testing without real music
 

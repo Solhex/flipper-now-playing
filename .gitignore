@@ -2,3 +2,8 @@ __pycache__/
 *.pyc
 dist/
 .vscode/
+windows-support.patch
+.venv/
+.buildenv/
+
+extension/dist/
