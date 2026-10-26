@@ -769,18 +769,19 @@ static void draw_now_playing(Canvas* canvas, App* app) {
     int h = text_top - text_gap - bar_y; /* the bar fills what is left */
     if(h > 0) draw_bar(canvas, 2, bar_y, 124, h, app->pos, app->dur);
 
-    /* The heart sits in the middle of the row under the bar — the time row is
-     * empty there (elapsed hard left, total hard right), so it needs no room and
-     * covers nothing. Liked is a heart, not-liked a cracked heart, and an unknown
-     * state draws nothing: the screen never claims something the PC cannot see. */
-    if(app->liked != 2) {
-        const uint8_t* icon = app->liked == 1 ? HEART_BITS : HEART_BROKEN;
+    /* A heart in the middle of the row under the bar — the time row is empty
+     * there (elapsed hard left, total hard right), so it needs no room and covers
+     * nothing. Only a liked track draws one: an unliked track is the normal case
+     * and a cracked heart on every one of them was just noise on the screen. The
+     * cracked heart still appears in the toast right after an unlike, where it is
+     * news rather than decoration. */
+    if(app->liked == 1) {
         int hx = 64 - HEART_W / 2;
         /* Bottom-aligned with the time digits: the last row of the screen is the
          * baseline the elapsed/total text sits on, so the heart ends level with
          * it instead of floating just under the bar. */
         int hy = 63 - HEART_H + 1;
-        canvas_draw_xbm(canvas, hx, hy, HEART_W, HEART_H, icon);
+        canvas_draw_xbm(canvas, hx, hy, HEART_W, HEART_H, HEART_BITS);
     }
 
     char elapsed[12], total[12];
