@@ -241,8 +241,9 @@ python extension/build.py
 #   extension/dist/ytm-bridge-1.0.0-chrome.zip    (+ unpacked in dist/chrome)
 ```
 
-- **Chrome / Edge**: `chrome://extensions` -> Developer mode -> *Load unpacked* ->
-  `extension/dist/chrome` (or the `extension` folder itself).
+- **Chrome / Edge / Brave**: `chrome://extensions` (or `brave://extensions`) ->
+  Developer mode -> *Load unpacked* -> `extension/dist/chrome` (or the `extension`
+  folder itself, which is what the tests use).
 - **Firefox, temporary**: `about:debugging#/runtime/this-firefox` -> *Load
   Temporary Add-on* -> `extension/dist/firefox/manifest.json`. Firefox drops it
   when the browser closes.
@@ -275,10 +276,23 @@ from.
 
 `extension/test/` holds the harness used to verify this: a mock page with the
 site's like-button DOM, and a script that loads the extension (working copy or a
-packaged build) into a headless Chromium browser and drives the bridge
-(`python extension/test/run_extension_test.py 50 [extension/dist/chrome]`). It
-talks to the *running* bridge, so stop the bridge first if you want the test's
-own state to be the one you read back.
+packaged build) into a headless Chromium browser and drives it:
+
+```bash
+python extension/test/run_extension_test.py 40 extension/dist/chrome
+YTM_TEST_BROWSER="C:/Program Files/BraveSoftware/Brave-Browser/Application/brave.exe" \
+    python extension/test/run_extension_test.py
+```
+
+It starts its **own** bridge on a free port and re-points the copied extension at
+it, so your real bridge, your browser and your music are untouched. It prints
+PASS when the extension reported the mock track and a toggle round-trip liked and
+unliked it. Verified against Brave, Edge and Firefox.
+
+`link_toggle` retries once when no state change comes back: a freshly started
+service worker has not attached its content script yet, so the first command can
+land on nobody. A heartbeat never counts as a result — it only watches the
+`liked` value move.
 
 ### 2. Firefox's own debug port
 

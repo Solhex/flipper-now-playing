@@ -198,6 +198,7 @@ class BrowserLink:
         self.playing = None
         self.updated = 0.0          # monotonic, when /state last arrived
         self.requests = 0           # how many reports arrived since start
+        self.changes = 0            # how many times "liked" actually changed
         self.polls = 0              # long-poll requests: proof the extension listens
         self._commands = queue.Queue()
         self._lock = threading.Lock()
@@ -215,6 +216,8 @@ class BrowserLink:
             self.playing = playing
             self.updated = time.monotonic()
             self.requests += 1
+            if changed:
+                self.changes += 1
         return changed
 
     def fresh(self, max_age=6.0):
@@ -226,6 +229,7 @@ class BrowserLink:
         with self._lock:
             return {"liked": self.liked, "title": self.title, "artist": self.artist,
                     "playing": self.playing, "reports": self.requests,
+                    "changes": self.changes,
                     "polls": self.polls, "fresh": bool(self.updated and
                                                        time.monotonic() - self.updated < 6.0)}
 
@@ -261,6 +265,7 @@ class BrowserLink:
                         self.title = data.get("title", "")
                         self.artist = data.get("artist", "")
                         self.playing = data.get("playing")
+                        self.changes = data.get("changes", self.changes)
                         self.updated = time.monotonic()
             except Exception:
                 pass
@@ -387,21 +392,28 @@ class BrowserLink:
         self._server = None
 
 
-def link_toggle(link, timeout=3.0):
+def link_toggle(link, timeout=2.5, attempts=2):
     """Ask the extension to press like; returns the new state, or None.
+
+    Waits for the *like state* to move, not for any report: the page heartbeats
+    every couple of seconds regardless, and a fresh service worker that has not
+    attached its content script yet swallows the first command outright — the
+    message simply has nobody to land on. Hence the retry, which costs nothing
+    when the first click worked (the state moved, so it returns at once).
 
     None means "no extension is reporting", not "failed": the caller then falls
     back to the debug port or to typing at the window.
     """
     if link is None or not link.fresh():
         return None
-    before = link.updated
-    link.request_toggle()
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        time.sleep(0.05)
-        if link.updated != before:      # the page reported back
-            return link.liked
+    for _ in range(max(1, attempts)):
+        before = link.changes
+        link.request_toggle()
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            time.sleep(0.05)
+            if link.changes != before:
+                return link.liked
     return None
 
 

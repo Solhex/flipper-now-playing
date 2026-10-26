@@ -199,6 +199,71 @@ class TrackUrlTests(unittest.TestCase):
         self.assertFalse(y.is_track_url(""))
 
 
+class LinkToggleTests(unittest.TestCase):
+    """What `link_toggle` promises the like button on the device."""
+
+    def setUp(self):
+        self.port = free_port()
+        self.link = y.BrowserLink(self.port)
+        self.assertTrue(self.link.start(), self.link.error)
+        self.base = f"http://127.0.0.1:{self.port}"
+
+    def tearDown(self):
+        self.link.close()
+
+    def post(self, liked, title="Song"):
+        body = json.dumps({"liked": liked, "title": title}).encode()
+        request = urllib.request.Request(f"{self.base}/state", data=body, method="POST",
+                                         headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(request, timeout=5).read()
+
+    def test_no_extension_means_none(self):
+        self.assertIsNone(y.link_toggle(self.link, timeout=0.2, attempts=1))
+
+    def test_returns_the_new_state_once_it_moves(self):
+        self.post(False)
+
+        def page():
+            # the extension: take the command, click, report the result
+            with urllib.request.urlopen(f"{self.base}/wait", timeout=5) as reply:
+                json.load(reply)
+            self.post(True, "Song (liked)")
+
+        threading.Thread(target=page, daemon=True).start()
+        self.assertIs(y.link_toggle(self.link, timeout=3.0), True)
+
+    def test_retries_when_the_first_command_is_swallowed(self):
+        self.post(False)
+        calls = []
+
+        def page():
+            for index in range(2):
+                with urllib.request.urlopen(f"{self.base}/wait", timeout=5) as reply:
+                    json.load(reply)
+                calls.append(index)
+                if index == 1:                 # first one lands nowhere
+                    self.post(True, "Song (liked)")
+
+        threading.Thread(target=page, daemon=True).start()
+        self.assertIs(y.link_toggle(self.link, timeout=0.6, attempts=3), True)
+        self.assertEqual(len(calls), 2)
+
+    def test_heartbeats_do_not_count_as_a_like(self):
+        self.post(False)
+        stop = threading.Event()
+
+        def heartbeats():
+            while not stop.is_set():
+                self.post(False)               # unchanged: same state
+                time.sleep(0.1)
+
+        threading.Thread(target=heartbeats, daemon=True).start()
+        try:
+            self.assertIsNone(y.link_toggle(self.link, timeout=0.5, attempts=1))
+        finally:
+            stop.set()
+
+
 class BrowserLinkTests(unittest.TestCase):
     """The localhost protocol the extension speaks."""
 
