@@ -94,6 +94,23 @@ CMD_CAPS = "k"                    # device -> PC: "I take clock-only META frames
 CMD_LIKE = "l"                    # device -> PC: hold OK, toggle like
 
 
+# CREATE_NO_WINDOW. A GUI-subsystem process (pythonw.exe, which is what the logon
+# shortcut runs) has no console, so spawning a console app — yt-dlp is one — makes
+# Windows allocate a fresh console *window*: a terminal flashes up on every new
+# track, which looks like the app is doing something wrong. Suppress it.
+CREATE_NO_WINDOW = 0x08000000
+
+
+def hidden_process_kwargs():
+    """subprocess kwargs that keep a console child from flashing a window."""
+    if not IS_WINDOWS:
+        return {}
+    startup = subprocess.STARTUPINFO()
+    startup.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startup.wShowWindow = 0                      # SW_HIDE
+    return {"creationflags": CREATE_NO_WINDOW, "startupinfo": startup}
+
+
 def resolve_ytdlp():
     """Find yt-dlp, preferring the one beside our own interpreter.
 
@@ -1440,6 +1457,7 @@ class Bridge:
                 [self.ytdlp, "--no-warnings", "--no-playlist", "--skip-download",
                  "--print", "%(duration)s", target],
                 capture_output=True, text=True, timeout=30,
+                **hidden_process_kwargs(),
             )
             return int(float(out.stdout.strip().splitlines()[0]))
         except Exception:

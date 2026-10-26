@@ -29,6 +29,10 @@ import sys
 from pathlib import Path
 
 SHORTCUT_NAME = "YT Music Remote Bridge.lnk"
+# PowerShell is a console app: launched from pythonw.exe it would open a console
+# window of its own. The installer usually runs from a terminal, but keeping it
+# silent costs nothing and avoids a flash when it is re-run from a scheduled task.
+CREATE_NO_WINDOW = 0x08000000
 HERE = Path(__file__).resolve().parent
 BRIDGE = HERE / "ytm_bridge.py"
 
@@ -73,7 +77,7 @@ $lnk.Save()
 """
     result = subprocess.run(
         ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-        capture_output=True, text=True)
+        capture_output=True, text=True, creationflags=CREATE_NO_WINDOW)
     if result.returncode != 0:
         sys.exit(f"could not create the shortcut: {result.stderr.strip()}")
 
@@ -91,7 +95,7 @@ Write-Output $lnk.WorkingDirectory
 """
     result = subprocess.run(
         ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-        capture_output=True, text=True)
+        capture_output=True, text=True, creationflags=CREATE_NO_WINDOW)
     if result.returncode != 0:
         return None
     lines = [line.strip() for line in result.stdout.splitlines()]
