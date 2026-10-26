@@ -63,6 +63,9 @@ DUR_CACHE_MAX = 200    # distinct tracks to remember lengths for
 DUR_RETRY_S = 20       # seconds before retrying a length lookup that failed
 WINDOW_CACHE_S = 2.0   # how long the AUMID -> window map is reused
 REFRESH_S = 0.4        # Windows: how often the media-session manager is re-requested
+ART_SETTLE_S = 4.0     # Windows: how long a new track's cover is still being published
+ART_RETRY_S = 0.4      # Windows: cover re-read interval while a track settles
+ART_RECHECK_S = 5.0    # Windows: cover re-read interval once settled, if still missing
 
 FRAME_META, FRAME_ART, FRAME_VOL, FRAME_TOAST = 0x01, 0x02, 0x03, 0x04
 TOAST_MAX = 24         # the device shows one short line
@@ -681,6 +684,8 @@ if IS_WINDOWS:
             self._volume = AppVolume()
             self._pid = None
             self._guard = {"key": None, "pos": 0.0, "trusted": False}
+            self._art_try = 0.0
+            self._art_started = 0.0
             self._volume_cache = (0.0, None)
             self._warned_missing = False
             self._sink = None
@@ -811,17 +816,35 @@ if IS_WINDOWS:
 
             pos, dur = self._timeline(session, (title, artist), playing)
 
-            # Cover art is a plain byte stream, and it only changes per track:
-            # decoding it on every poll would be 20 PNGs a second.
+            # Cover art is a byte stream, and reading it is cheap while building
+            # the 1-bit bitmap is not — so the bytes are kept and the frame is
+            # only rebuilt when they change (Bridge compares them).
+            #
+            # The catch is *when* to read them. A browser publishes the track
+            # before it has the new cover: for a moment the session still hands
+            # out the previous track's thumbnail, and a single read per track
+            # then left that old cover on the device for the whole song. So the
+            # thumbnail is re-read for the first few seconds of a track, and
+            # slower afterwards if it never arrived at all.
+            now = time.monotonic()
             key = (title, artist)
             if key != self._art_key:
                 self._art_key, self._art = key, None
+                self._art_started = now
+                self._art_try = 0.0
+            settling = now - self._art_started < ART_SETTLE_S
+            due = now - self._art_try > (ART_RETRY_S if settling else ART_RECHECK_S)
+            if due and (settling or self._art is None):
+                self._art_try = now
                 reference = getattr(props, "thumbnail", None)
                 if reference is not None:
                     try:
-                        self._art = await self._thumbnail(reference)
+                        candidate = await self._thumbnail(reference)
                     except Exception as exc:
+                        candidate = None
                         print("  art read failed:", exc)
+                    if candidate and candidate != self._art:
+                        self._art = candidate
 
             self._pid = self._pid_for(session)
             return {
