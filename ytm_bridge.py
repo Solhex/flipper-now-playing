@@ -2,12 +2,17 @@
 """
 ytm_bridge — PC side of the "YT Music Remote" Flipper Zero app.
 
-Reads what's playing from the desktop media session (MPRIS, via playerctl),
-pushes title/artist/progress/volume/album-art to the Flipper over Bluetooth LE,
-and runs the playback commands the Flipper sends back.
+Reads what's playing from the desktop media session, pushes
+title/artist/progress/volume/album-art to the Flipper over Bluetooth LE, and
+runs the playback commands the Flipper sends back.
 
 Transport: the Flipper's BLE serial GATT service (the same one the official
 mobile app uses). We connect as BLE central and exchange raw bytes.
+
+Media source: on Linux this is MPRIS via playerctl, on Windows it is the
+Windows media session (SMTC, the same source the volume flyout shows) read
+through WinRT. Firefox appears in both, but each platform has its own quirks,
+which is what the per-platform backends below deal with.
 
 Wire format (PC -> Flipper) — [type:1][len:2 LE][payload:len]
     0x01 META: [state:1][pos:2 LE][dur:2 LE][title utf8]0[artist utf8]0
@@ -16,18 +21,19 @@ Wire format (PC -> Flipper) — [type:1][len:2 LE][payload:len]
 Flipper -> PC: one command byte each (CMD_TRANSPORT / CMD_VOLUME below)
     p play/pause   n next   b previous   - seek back   + seek forward
     u volume up    d volume down
-
-Requires: bleak, pillow  (pip install bleak pillow), playerctl, and optionally
-yt-dlp (track length for players that report no mpris:length).
 """
 
 import argparse
 import asyncio
+import concurrent.futures
+import io
 import json
 import os
 import shutil
+import queue
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -38,10 +44,13 @@ try:
 except ImportError:
     sys.exit("Missing dependency: pip install bleak")
 
+IS_WINDOWS = sys.platform == "win32"
+
 # ---- tunables ----
 ART_SIZE = 44          # px, square; the largest cover that still leaves a row
                        # between it and the bar (64 rows: cover 44 + bar 7 + time 8)
-SEEK_STEP = 5          # seconds per seek tap
+SEEK_STEP = 5          # seconds per seek tap (MPRIS players)
+SEEK_STEP_WIN = 10     # seconds per seek tap on Windows: YT Music's l/h shortcut
 VOLUME_STEP = 0.05     # fraction of full scale per volume key press
 POLL_HZ = 20           # metadata pushes per second (override with --hz)
 POLL_HZ_MAX = 25
@@ -52,16 +61,34 @@ TITLE_MAX = 64         # keep a META frame inside the device's bounds
 ARTIST_MAX = 48
 DUR_CACHE_MAX = 200    # distinct tracks to remember lengths for
 DUR_RETRY_S = 20       # seconds before retrying a length lookup that failed
+WINDOW_CACHE_S = 2.0   # how long the AUMID -> window map is reused
+REFRESH_S = 0.4        # Windows: how often the media-session manager is re-requested
 
 FRAME_META, FRAME_ART, FRAME_VOL, FRAME_TOAST = 0x01, 0x02, 0x03, 0x04
 TOAST_MAX = 24         # the device shows one short line
 
-# Toggling like means typing YouTube Music's web-app shortcut (shift+=), because
-# MPRIS has no like action. vkkey is a small Wayland virtual-keyboard client built
-# into ~/.local/share/ytm-remote/bin (see its source there); the service gets a
-# bare PATH, so it is addressed by path rather than looked up.
-VKKEY = Path.home() / ".local/share/ytm-remote/bin/vkkey"
-LIKE_KEYS = ["-m", "1", "13"]  # 1 = shift, 13 = '='
+# ---------------------------------------------------------------- state files
+# Linux keeps its scratch under ~/.cache (what the service and check_time.py
+# expect); Windows uses LOCALAPPDATA so nothing lands in a hidden dot-directory.
+if IS_WINDOWS:
+    STATE_DIR = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "ytm-remote"
+else:
+    STATE_DIR = Path.home() / ".cache" / "ytm-remote"
+STATUS_PATH = str(STATE_DIR / "status.json")
+ADDRESS_PATH = str(STATE_DIR / "flipper.json")
+
+CMD_MAP_SEEK_BACK = f"{SEEK_STEP}-"
+CMD_MAP_SEEK_FWD = f"{SEEK_STEP}+"
+CMD_TRANSPORT = {
+    "p": ["play-pause"],
+    "n": ["next"],
+    "b": ["previous"],
+    "-": ["position", CMD_MAP_SEEK_BACK],
+    "+": ["position", CMD_MAP_SEEK_FWD],
+}
+CMD_VOLUME = {"u": +1, "d": -1}   # direction for do_volume
+CMD_CAPS = "k"                    # device -> PC: "I take clock-only META frames"
+CMD_LIKE = "l"                    # device -> PC: hold OK, toggle like
 
 
 def resolve_ytdlp():
@@ -70,14 +97,180 @@ def resolve_ytdlp():
     Run as a service this process gets a bare PATH (/usr/local/bin:/usr/bin), so
     shutil.which() alone finds nothing and every track length silently stays
     unknown -- install it into the bridge's own venv and it is always found.
+    On Windows a venv keeps it in Scripts\\, so that directory is checked too.
     """
-    beside = Path(sys.executable).with_name("yt-dlp")
-    if beside.exists():
-        return str(beside)
+    exe = "yt-dlp.exe" if IS_WINDOWS else "yt-dlp"
+    calls = [Path(sys.executable).with_name(exe),
+             Path(sys.executable).parent / "Scripts" / exe]
+    for candidate in calls:
+        if candidate.exists():
+            return str(candidate)
     found = shutil.which("yt-dlp")
     if not found:
         print("yt-dlp not found: track lengths will show as --:--")
     return found
+
+
+def load_known_address():
+    """BLE address of the Flipper from the last successful connection."""
+    try:
+        with open(ADDRESS_PATH) as handle:
+            return json.load(handle).get("address")
+    except (OSError, ValueError):
+        return None
+
+
+def save_known_address(address):
+    try:
+        os.makedirs(os.path.dirname(ADDRESS_PATH), exist_ok=True)
+        tmp = ADDRESS_PATH + ".tmp"
+        with open(tmp, "w") as handle:
+            json.dump({"address": address}, handle)
+        os.replace(tmp, ADDRESS_PATH)
+    except OSError:
+        pass
+
+
+def pct(fraction):
+    """0.0..1.0 volume -> whole percent, or None if the player reports none."""
+    try:
+        return max(0, min(100, int(round(float(fraction) * 100))))
+    except (TypeError, ValueError):
+        return None
+
+
+# ================================================================ Linux: MPRIS
+class MprisBackend:
+    """Linux/BSD media sessions through playerctl (MPRIS over D-Bus)."""
+
+    name = "mpris"
+    seek_step = SEEK_STEP
+
+    def __init__(self, player=None):
+        self.player = player
+
+    # ---- helpers shared with the old module-level API
+    def run_playerctl(self, *args):
+        """playerctl for one player. Returns (ok, stdout); the caller decides what
+        a failure means (routine during a poll, worth reporting for a button)."""
+        try:
+            out = subprocess.run(
+                ["playerctl", "-p", self.player, *args], capture_output=True, text=True
+            )
+        except FileNotFoundError:
+            return False, ""
+        return out.returncode == 0, out.stdout
+
+    def list(self):
+        try:
+            out = subprocess.run(["playerctl", "-l"], capture_output=True, text=True)
+        except FileNotFoundError:
+            sys.exit("playerctl not found — install it to read the media session")
+        return [p for p in out.stdout.splitlines() if p.strip()]
+
+    async def read(self):
+        """Return dict(title, artist, art, playing, pos, dur, url, vol) or None.
+
+        Runs on the event loop on purpose: playerctl answers in a few
+        milliseconds and this is the poll itself (see Bridge.run). The playerctl
+        calls triggered by device events go through an executor instead.
+        """
+        fields = (
+            "status",
+            "position",
+            "mpris:length",
+            "xesam:title",
+            "xesam:artist",
+            "mpris:artUrl",
+            "xesam:url",
+            "volume",      # playerctl exposes Volume through the metadata format too
+        )
+        fmt = "\t".join("{{%s}}" % field for field in fields)
+        ok, stdout = self.run_playerctl("metadata", "--format", fmt)
+        if not ok or not stdout.strip():
+            return None
+
+        parts = stdout.rstrip("\n").split("\t")
+        parts += [""] * (len(fields) - len(parts))
+        f = dict(zip(fields, parts))
+
+        def us(value):
+            try:
+                return max(0, int(value) // 1_000_000)
+            except ValueError:
+                return 0
+
+        art = f["mpris:artUrl"]
+        art_path = None
+        if art.startswith("file://") and os.path.exists(art[len("file://"):]):
+            art_path = art[len("file://"):]
+
+        return {
+            "title": (f["xesam:title"] or "Unknown").strip(),
+            "artist": (f["xesam:artist"] or "").strip(),
+            "art": art_path,
+            "playing": f["status"].strip().lower() == "playing",
+            "pos": us(f["position"]),
+            "dur": us(f["mpris:length"]),
+            "url": (f["xesam:url"] or "").strip(),
+            "vol": pct(f["volume"]),
+            "app": self.player or "",
+        }
+
+    async def command(self, ch):
+        args = CMD_TRANSPORT.get(ch)
+        if not args:
+            return
+        ok, _ = self.run_playerctl(*args)
+        if ok:
+            print(f"  <- command {ch!r} -> playerctl {' '.join(args)}")
+        else:
+            print(f"  !! command {ch!r} failed: playerctl {' '.join(args)}")
+
+    def volume(self, sign):
+        """Nudge the volume by VOLUME_STEP; returns the new level or None."""
+        step = f"{VOLUME_STEP:g}{'+' if sign > 0 else '-'}"
+        self.run_playerctl("volume", step)
+        ok, out = self.run_playerctl("volume")
+        return pct(out) if ok else None
+
+    def like(self):
+        """Toggle like on the YouTube Music tab. Returns (ok, message).
+
+        The like shortcut belongs to the web app, so it can only be typed at a
+        focused window — there is no way to address a browser tab from outside.
+        A window whose *title* shows YouTube Music has it as its active tab, so
+        that is what gets checked: firing the keystroke blind would type a '+'
+        into whatever else happened to have focus.
+        """
+        vkkey = Path.home() / ".local/share/ytm-remote/bin/vkkey"
+        if not vkkey.exists():
+            return False, "Like: vkkey missing"
+
+        windows = sway_windows()
+        if not windows:
+            return False, "Like: cannot check focus"
+
+        previous = windows[0][0] if windows[0][2] else None
+        target = next((w for w in windows if "youtube music" in w[1].lower()), None)
+        if target is None:
+            return False, "Open the YT Music tab"
+
+        moved = False
+        try:
+            if not target[2]:
+                swaymsg(f"[con_id={target[0]}] focus")
+                moved = True
+                time.sleep(0.35)      # let the focus change land before typing
+            subprocess.run([str(vkkey), "-m", "1", "13"], capture_output=True, timeout=5)
+        except Exception as e:
+            return False, f"Like failed: {e}"
+        finally:
+            if moved and previous:
+                time.sleep(0.15)
+                swaymsg(f"[con_id={previous}] focus")   # give focus back
+        return True, "Like toggled"
+
 
 def sway_socket():
     """The running sway IPC socket, if there is one."""
@@ -121,98 +314,6 @@ def sway_windows():
     return found
 
 
-def toggle_like():
-    """Toggle like on the YouTube Music tab. Returns (ok, message).
-
-    The like shortcut belongs to the web app, so it can only be typed at a
-    focused window — there is no way to address a browser tab from outside. A
-    window whose *title* shows YouTube Music has it as its active tab, so that is
-    what gets checked: firing the keystroke blind would type a '+' into whatever
-    else happened to have focus.
-    """
-    if not VKKEY.exists():
-        return False, "Like: vkkey missing"
-
-    windows = sway_windows()
-    if not windows:
-        return False, "Like: cannot check focus"
-
-    previous = windows[0][0] if windows[0][2] else None
-    target = next((w for w in windows if "youtube music" in w[1].lower()), None)
-    if target is None:
-        return False, "Open the YT Music tab"
-
-    moved = False
-    try:
-        if not target[2]:
-            swaymsg(f"[con_id={target[0]}] focus")
-            moved = True
-            time.sleep(0.35)          # let the focus change land before typing
-        subprocess.run([str(VKKEY), *LIKE_KEYS], capture_output=True, timeout=5)
-    except Exception as e:
-        return False, f"Like failed: {e}"
-    finally:
-        if moved and previous:
-            time.sleep(0.15)
-            swaymsg(f"[con_id={previous}] focus")   # give focus back
-    return True, "Like toggled"
-
-
-def is_track_url(url):
-    """True when the URL addresses the track itself rather than just the site.
-
-    Firefox reports the *tab's* URL, and YouTube Music keeps playing while you
-    browse, so it is often only the home page — looking that up gets
-    "Unsupported URL" and the track shows no length.
-    """
-    return bool(url) and ("/watch?" in url or "youtu.be/" in url)
-
-
-# Live snapshot of what the device is being fed, for tooling (check_time.py).
-# Rewritten at most once a second, so reading it costs nothing and a wrong timer
-# can be spotted without watching the screen.
-STATUS_PATH = os.path.expanduser("~/.cache/ytm-remote/status.json")
-
-CMD_MAP_SEEK_BACK = f"{SEEK_STEP}-"
-CMD_MAP_SEEK_FWD = f"{SEEK_STEP}+"
-CMD_TRANSPORT = {
-    "p": ["play-pause"],
-    "n": ["next"],
-    "b": ["previous"],
-    "-": ["position", CMD_MAP_SEEK_BACK],
-    "+": ["position", CMD_MAP_SEEK_FWD],
-}
-CMD_VOLUME = {"u": +1, "d": -1}   # direction for do_volume
-CMD_CAPS = "k"                    # device -> PC: "I take clock-only META frames"
-CMD_LIKE = "l"                    # device -> PC: hold OK, toggle like
-
-# The format string is built from the field list, so the two cannot disagree.
-META_FIELDS = (
-    "status",
-    "position",
-    "mpris:length",
-    "xesam:title",
-    "xesam:artist",
-    "mpris:artUrl",
-    "xesam:url",
-    "volume",          # playerctl exposes Volume through the metadata format too
-)
-META_FMT = "\t".join("{{%s}}" % name for name in META_FIELDS)
-
-
-# ---------------------------------------------------------------- MPRIS
-def run_playerctl(player, *args):
-    """playerctl for one player. Returns (ok, stdout); the caller decides what a
-    failure means (routine during a poll, worth reporting for a button press)."""
-    try:
-        out = subprocess.run(
-            ["playerctl", "-p", player, *args], capture_output=True, text=True
-        )
-    except FileNotFoundError:
-        return False, ""
-    return out.returncode == 0, out.stdout
-
-
 def track_start_age(art_path, max_age=6 * 3600):
     """Seconds since Firefox wrote this track's artwork.
 
@@ -221,7 +322,7 @@ def track_start_age(art_path, max_age=6 * 3600):
     which is what lets the bridge join a song already in progress and still show
     the true elapsed time. Returns None when the age is implausible.
     """
-    if not art_path:
+    if not art_path or not isinstance(art_path, str):
         return None
     try:
         age = time.time() - os.path.getmtime(art_path)
@@ -230,77 +331,696 @@ def track_start_age(art_path, max_age=6 * 3600):
     return age if 0 <= age < max_age else None
 
 
-def pct(fraction):
-    """0.0..1.0 volume -> whole percent, or None if the player reports none."""
+# ============================================================== Windows: SMTC
+if IS_WINDOWS:
+    import ctypes
+    from ctypes import wintypes
+
+    _user32 = ctypes.WinDLL("user32", use_last_error=True)
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    WM_APPCOMMAND = 0x0319
+    APPCOMMAND_MEDIA_NEXTTRACK = 11
+    APPCOMMAND_MEDIA_PREVIOUSTRACK = 12
+    APPCOMMAND_MEDIA_PLAY_PAUSE = 14
+
+    VK_SHIFT, VK_OEM_PLUS = 0x10, 0xBB
+    VK_H, VK_L = 0x48, 0x4C           # YT Music: -10 s / +10 s
+    SW_RESTORE = 9
+
+    ULONG_PTR = ctypes.c_ulonglong
+    INPUT_KEYBOARD = 1
+    KEYEVENTF_KEYUP = 0x0002
+    KEYEVENTF_EXTENDEDKEY = 0x0001
+
+    class _MOUSEINPUT(ctypes.Structure):
+        _fields_ = [("dx", wintypes.LONG), ("dy", wintypes.LONG),
+                    ("mouseData", wintypes.DWORD), ("dwFlags", wintypes.DWORD),
+                    ("time", wintypes.DWORD), ("dwExtraInfo", ULONG_PTR)]
+
+    class _KEYBDINPUT(ctypes.Structure):
+        _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD),
+                    ("dwFlags", wintypes.DWORD), ("time", wintypes.DWORD),
+                    ("dwExtraInfo", ULONG_PTR)]
+
+    class _HARDWAREINPUT(ctypes.Structure):
+        _fields_ = [("uMsg", wintypes.DWORD), ("wParamL", wintypes.WORD),
+                    ("wParamH", wintypes.WORD)]
+
+    class _INPUTUNION(ctypes.Union):
+        _fields_ = [("mi", _MOUSEINPUT), ("ki", _KEYBDINPUT), ("hi", _HARDWAREINPUT)]
+
+    class _INPUT(ctypes.Structure):
+        _anonymous_ = ("u",)
+        _fields_ = [("type", wintypes.DWORD), ("u", _INPUTUNION)]
+
+    _ENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    # COM must be initialised before the shell property store is asked anything,
+    # and it has to be the multithreaded apartment: WinRT's async completions
+    # arrive on an MTA thread, and an STA caller would wait forever on them
+    # without a message pump (which asyncio does not run).
     try:
-        return max(0, min(100, int(round(float(fraction) * 100))))
-    except (TypeError, ValueError):
-        return None
+        ctypes.windll.ole32.CoInitializeEx(None, 0)      # COINIT_MULTITHREADED
+    except Exception:
+        pass
 
+    class WinWindow:
+        """A visible top-level window plus the AUMID the shell groups it under."""
 
-def list_players():
-    try:
-        out = subprocess.run(["playerctl", "-l"], capture_output=True, text=True)
-    except FileNotFoundError:
-        sys.exit("playerctl not found — install it to read the media session")
-    return [p for p in out.stdout.splitlines() if p.strip()]
+        __slots__ = ("hwnd", "pid", "process", "title", "aumid")
 
+        def __init__(self, hwnd, pid, process, title, aumid):
+            self.hwnd, self.pid, self.process = hwnd, pid, process
+            self.title, self.aumid = title, aumid
 
-def read_meta(player):
-    """Return dict(title, artist, art_path, playing, pos, dur, url, vol) or None.
+        def __repr__(self):
+            return f"<{self.process} {hex(self.hwnd)} {self.title[:24]!r}>"
 
-    Runs on the event loop on purpose: playerctl answers in a few milliseconds
-    and this is the poll itself (see Bridge.run). The playerctl calls that are
-    triggered by device events go through an executor instead.
-    """
-    ok, stdout = run_playerctl(player, "metadata", "--format", META_FMT)
-    if not ok or not stdout.strip():
-        return None
+    class _GUID(ctypes.Structure):
+        _fields_ = [("Data1", ctypes.c_ulong), ("Data2", ctypes.c_ushort),
+                    ("Data3", ctypes.c_ushort), ("Data4", ctypes.c_ubyte * 8)]
 
-    parts = stdout.rstrip("\n").split("\t")
-    parts += [""] * (len(META_FIELDS) - len(parts))
-    f = dict(zip(META_FIELDS, parts))
+        @classmethod
+        def parse(cls, text):
+            import uuid
+            value = uuid.UUID(text)
+            return cls(value.time_low, value.time_mid, value.time_hi_version,
+                       (ctypes.c_ubyte * 8)(*value.bytes[8:]))
 
-    def us(value):
+    class _PROPERTYKEY(ctypes.Structure):
+        _fields_ = [("fmtid", _GUID), ("pid", ctypes.c_uint)]
+
+    class _PROPVARIANTUNION(ctypes.Union):
+        _fields_ = [("pwszVal", ctypes.c_wchar_p), ("ulVal", ctypes.c_ulong),
+                    ("ullVal", ctypes.c_ulonglong), ("pointer", ctypes.c_void_p)]
+
+    class _PROPVARIANT(ctypes.Structure):
+        _fields_ = [("vt", ctypes.c_ushort), ("r1", ctypes.c_ushort),
+                    ("r2", ctypes.c_ushort), ("r3", ctypes.c_ushort),
+                    ("u", _PROPVARIANTUNION)]
+
+    _PKEY_AUMID = _PROPERTYKEY(_GUID.parse("{9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3}"), 5)
+    _IID_IPROPERTYSTORE = _GUID.parse("{886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99}")
+    _VT_LPWSTR = 31
+
+    def _aumid_of_window(hwnd):
+        """The window's AppUserModelID, read through the shell property store.
+
+        This is what ties an SMTC session (which only knows an AUMID) back to a
+        process: Firefox's session id is a hash of its install path, so the name
+        has to come from the window the shell groups it under.
+
+        Called through the raw vtable rather than comtypes on purpose: importing
+        comtypes calls CoInitializeEx(STA) on this thread, which leaves the
+        WinRT awaits used by the media-session manager waiting for a message pump
+        that an asyncio loop never runs -- a hang, not an error.
+        """
+        shell32 = ctypes.WinDLL("shell32")
+        shell32.SHGetPropertyStoreForWindow.argtypes = [
+            wintypes.HWND, ctypes.POINTER(_GUID), ctypes.POINTER(ctypes.c_void_p)]
+        shell32.SHGetPropertyStoreForWindow.restype = ctypes.c_long
+        store = ctypes.c_void_p()
+        if shell32.SHGetPropertyStoreForWindow(hwnd, ctypes.byref(_IID_IPROPERTYSTORE),
+                                               ctypes.byref(store)) != 0 or not store:
+            return None
         try:
-            return max(0, int(value) // 1_000_000)
-        except ValueError:
-            return 0
+            vtable = ctypes.cast(store, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
+            get_value = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p,
+                                           ctypes.POINTER(_PROPERTYKEY),
+                                           ctypes.POINTER(_PROPVARIANT))(vtable[5])
+            value = _PROPVARIANT()
+            if get_value(store, ctypes.byref(_PKEY_AUMID), ctypes.byref(value)) != 0:
+                return None
+            if value.vt != _VT_LPWSTR or not value.u.pwszVal:
+                return None
+            text = value.u.pwszVal
+            ctypes.windll.ole32.PropVariantClear(ctypes.byref(value))
+            return text
+        finally:
+            release = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(
+                ctypes.cast(store, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents[2])
+            release(store)
 
-    art = f["mpris:artUrl"]
-    art_path = None
-    if art.startswith("file://") and os.path.exists(art[len("file://"):]):
-        art_path = art[len("file://"):]
+    def list_windows():
+        """Visible, titled top-level windows with process names and AUMIDs."""
+        import psutil
 
-    return {
-        "title": (f["xesam:title"] or "Unknown").strip(),
-        "artist": (f["xesam:artist"] or "").strip(),
-        "art_path": art_path,
-        "playing": f["status"].strip().lower() == "playing",
-        "pos": us(f["position"]),
-        "dur": us(f["mpris:length"]),
-        "url": (f["xesam:url"] or "").strip(),
-        "vol": pct(f["volume"]),
-    }
+        rows = []
 
+        def cb(hwnd, _):
+            length = _user32.GetWindowTextLengthW(hwnd)
+            if length and _user32.IsWindowVisible(hwnd):
+                buf = ctypes.create_unicode_buffer(length + 1)
+                _user32.GetWindowTextW(hwnd, buf, length + 1)
+                pid = wintypes.DWORD()
+                _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                try:
+                    process = psutil.Process(pid.value).name()
+                except Exception:
+                    process = ""
+                rows.append(WinWindow(hwnd, pid.value, process or "", buf.value,
+                                      _aumid_of_window(hwnd)))
+            return True
 
-def do_command(player, ch):
-    args = CMD_TRANSPORT.get(ch)
-    if not args:
-        return
-    ok, _ = run_playerctl(player, *args)
-    if ok:
-        print(f"  <- command {ch!r} -> playerctl {' '.join(args)}")
-    else:
-        print(f"  !! command {ch!r} failed: playerctl {' '.join(args)}")
+        _user32.EnumWindows(_ENUMPROC(cb), 0)
+        return rows
 
+    def _send_key(vk, up=False, extended=False):
+        event = _INPUT(type=INPUT_KEYBOARD)
+        event.ki = _KEYBDINPUT(wVk=vk, wScan=0,
+                               dwFlags=(KEYEVENTF_KEYUP if up else 0)
+                               | (KEYEVENTF_EXTENDEDKEY if extended else 0),
+                               time=0, dwExtraInfo=0)
+        return _user32.SendInput(1, ctypes.byref(event), ctypes.sizeof(_INPUT))
 
-def do_volume(player, sign):
-    """Nudge the volume by VOLUME_STEP; returns the new level or None."""
-    step = f"{VOLUME_STEP:g}{'+' if sign > 0 else '-'}"
-    run_playerctl(player, "volume", step)
-    ok, out = run_playerctl(player, "volume")
-    return pct(out) if ok else None
+    def tap_key(vk):
+        _send_key(vk)
+        _send_key(vk, up=True)
+
+    def chord(modifier, vk):
+        _send_key(modifier)
+        tap_key(vk)
+        _send_key(modifier, up=True)
+
+    def set_foreground(hwnd):
+        """Bring hwnd forward, working around the foreground lock.
+
+        SetForegroundWindow alone is refused when the caller is not the
+        foreground process; attaching to the current foreground thread's input
+        queue is the documented way around it.
+        """
+        foreground = _user32.GetForegroundWindow()
+        current = _kernel32.GetCurrentThreadId()
+        threads = {_user32.GetWindowThreadProcessId(foreground, None) if foreground else 0,
+                   current}
+        attached = [t for t in threads if t and _user32.AttachThreadInput(current, t, True)]
+        try:
+            if _user32.IsIconic(hwnd):
+                _user32.ShowWindow(hwnd, SW_RESTORE)
+            _user32.BringWindowToTop(hwnd)
+            _user32.SetForegroundWindow(hwnd)
+            return _user32.GetForegroundWindow() == hwnd
+        finally:
+            for thread in attached:
+                _user32.AttachThreadInput(current, thread, False)
+
+    def _post_appcommand(hwnd, appcommand):
+        return bool(_user32.PostMessageW(hwnd, WM_APPCOMMAND, 0, appcommand << 16))
+
+    def media_keys_window():
+        """Firefox's hidden "Firefox Media Keys" window, if it has one.
+
+        Firefox keeps a message-only window for media-key handling and routes
+        WM_APPCOMMAND from there. Posting at the visible browser window works
+        only while that tab happens to own the media element; the hidden window
+        is the sink Firefox itself listens on, so it is the reliable target.
+        """
+        import psutil
+
+        found = []
+
+        def cb(hwnd, _):
+            length = _user32.GetWindowTextLengthW(hwnd)
+            if length:
+                buf = ctypes.create_unicode_buffer(length + 1)
+                _user32.GetWindowTextW(hwnd, buf, length + 1)
+                if "media keys" in buf.value.lower():
+                    pid = wintypes.DWORD()
+                    _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                    try:
+                        if psutil.Process(pid.value).name().lower() == "firefox.exe":
+                            found.append(hwnd)
+                    except Exception:
+                        pass
+            return True
+
+        _user32.EnumWindows(_ENUMPROC(cb), 0)
+        return found[0] if found else None
+
+    class AppVolume:
+        """Per-app volume through Core Audio (the Windows mixer's slider).
+
+        pycaw is comtypes-based, and comtypes initialises COM as STA when it is
+        imported: on the event-loop thread that would stall the WinRT awaits the
+        media-session manager relies on (see _aumid_of_window). So the volume
+        work lives on its own thread, which owns that apartment, and the loop
+        only waits on a future.
+        """
+
+        def __init__(self):
+            self.ready = False
+            self._queue = queue.Queue()
+            self._thread = threading.Thread(target=self._run, daemon=True,
+                                            name="ytm-volume")
+            self._thread.start()
+            self.ready = True
+
+        def _run(self):
+            try:
+                from pycaw.pycaw import AudioUtilities
+            except Exception as exc:              # noqa: BLE001 - optional dep
+                print(f"Volume keys disabled: pycaw not installed "
+                      f"({exc.__class__.__name__}) - pip install pycaw")
+                self.ready = False
+                return
+            cache = {"at": 0.0, "session": None}
+
+            def session_for(pid):
+                now = time.monotonic()
+                cached = cache["session"]
+                if cached is not None and now - cache["at"] < 2.0:
+                    try:
+                        if pid is None or cached.ProcessId == pid:
+                            return cached
+                    except Exception:
+                        cache["session"] = None
+                best = None
+                for session in AudioUtilities.GetAllSessions():
+                    try:
+                        if session.Process is None:
+                            continue
+                        if pid is not None:
+                            if session.ProcessId == pid:
+                                best = session
+                                break
+                        elif getattr(session, "State", 0) == 1 and best is None:
+                            best = session        # first actively-playing app
+                    except Exception:
+                        continue
+                cache["at"], cache["session"] = now, best
+                return best
+
+            while True:
+                pid, sign, reply = self._queue.get()
+                try:
+                    session = session_for(pid)
+                    if session is None:
+                        reply.set_result(None)
+                        continue
+                    volume = session.SimpleAudioVolume
+                    if sign is None:                     # read
+                        reply.set_result(pct(volume.GetMasterVolume()))
+                    else:                                # nudge
+                        level = max(0.0, min(1.0, volume.GetMasterVolume()
+                                              + sign * VOLUME_STEP))
+                        volume.SetMasterVolume(level, None)
+                        reply.set_result(pct(level))
+                except Exception:
+                    reply.set_result(None)
+
+        def _call(self, pid, sign=None, timeout=1.5):
+            if not self.ready:
+                return None
+            reply = concurrent.futures.Future()
+            self._queue.put((pid, sign, reply))
+            try:
+                return reply.result(timeout=timeout)
+            except Exception:
+                return None
+
+        def get(self, pid):
+            return self._call(pid)
+
+        def nudge(self, pid, sign):
+            return self._call(pid, sign)
+
+    class WindowsBackend:
+        """Windows media sessions (SMTC) + Firefox-friendly playback control.
+
+        Two things the platform forces:
+
+        * Firefox neither reports a playback position for YouTube Music nor
+          honours SMTC's transport methods (they return True and do nothing), so
+          play/pause/next/previous go out as WM_APPCOMMAND messages posted to
+          the window instead, which the browser does act on.
+        * There is no window-manager API, so the like shortcut (and seek, which
+          has no SMTC equivalent for Firefox) is typed at the focused window
+          after raising the YouTube Music window the way a user would.
+        """
+
+        name = "smtc"
+        seek_step = SEEK_STEP_WIN
+
+        def __init__(self, hint=None):
+            from winrt.windows.media.control import (
+                GlobalSystemMediaTransportControlsSessionManager as Manager,
+                GlobalSystemMediaTransportControlsSessionPlaybackStatus as Status,
+            )
+            self.Manager, self.Status = Manager, Status
+            from winrt.windows.storage.streams import DataReader
+            self.DataReader = DataReader
+            self.hint = (hint or "").strip().lower()
+            self._manager = None
+            self._manager_at = 0.0
+            self._dirty = False
+            self.session = None
+            self._windows = (0.0, [])
+            self._art_key = None
+            self._art = None
+            self._volume = AppVolume()
+            self._pid = None
+            self._guard = {"key": None, "pos": 0.0, "trusted": False}
+            self._volume_cache = (0.0, None)
+            self._warned_missing = False
+            self._sink = None
+            self._sink_cache = (0.0, None)
+
+        # ---- sessions
+        async def _ensure_manager(self, force=False):
+            """A session manager, re-requested often enough to stay truthful.
+
+            A manager (and every session handed out by it) freezes the playback
+            state it had when it was requested: after a pause from outside, the
+            old object reports "playing" forever. Asking again is the only way to
+            see the change, and it costs a few milliseconds, so it is done on a
+            short timer and immediately after this bridge sends a command.
+            """
+            now = time.monotonic()
+            if force or self._manager is None or now - self._manager_at >= REFRESH_S:
+                self._manager = await self.Manager.request_async()
+                self._manager_at = now
+            return self._manager
+
+        def windows(self):
+            """Visible windows, refreshed at most every WINDOW_CACHE_S."""
+            since, cached = self._windows
+            if time.monotonic() - since < WINDOW_CACHE_S:
+                return cached
+            try:
+                rows = list_windows()
+            except Exception:
+                rows = []
+            self._windows = (time.monotonic(), rows)
+            return rows
+
+        def window_for(self, aumid, title_hint=None):
+            """The window of a session: by AUMID, else by the track title."""
+            rows = self.windows()
+            if aumid:
+                for row in rows:
+                    if row.aumid and row.aumid.lower() == aumid.lower():
+                        return row
+            if title_hint:
+                needle = title_hint.strip().lower()
+                for row in rows:
+                    if needle and needle[:20] in row.title.lower():
+                        return row
+            return None
+
+        def label(self, session):
+            """Friendly app name for a session ('firefox'), else its AUMID."""
+            aumid = getattr(session, "source_app_user_model_id", "") or ""
+            row = self.window_for(aumid)
+            if row and row.process:
+                stem = row.process.rsplit(".", 1)[0].lower()
+                return stem
+            return aumid
+
+        def _pick(self, sessions):
+            """The session to show: the hinted one, else a playing one, else the first."""
+            if self.hint:
+                matches = [s for s in sessions
+                           if self.hint in self.label(s).lower()
+                           or self.hint in (getattr(s, "source_app_user_model_id", "") or "").lower()]
+                if matches:
+                    for session in matches:
+                        if session.get_playback_info().playback_status == self.Status.PLAYING:
+                            return session
+                    return matches[0]
+                # A pinned player that is not running must not silently fall back
+                # to whatever else is playing: that would put the wrong track on
+                # the device.
+                if not self._warned_missing:
+                    self._warned_missing = True
+                    print(f"No media session matches --player {self.hint!r}; "
+                          f"waiting for it (see --list)")
+                return None
+            for session in sessions:
+                try:
+                    if session.get_playback_info().playback_status == self.Status.PLAYING:
+                        return session
+                except Exception:
+                    continue
+            return sessions[0] if sessions else None
+
+        async def list(self):
+            """Human-readable session list for --list."""
+            manager = await self._ensure_manager()
+            rows = []
+            for session in manager.get_sessions():
+                props = await session.try_get_media_properties_async()
+                try:
+                    status = self.Status(session.get_playback_info().playback_status).name
+                except Exception:
+                    status = "?"
+                rows.append(f"{self.label(session):<12} {props.title or '?'} — "
+                            f"{props.artist or '?'}  [{status.lower()}]")
+            return rows
+
+        async def _thumbnail(self, reference):
+            stream = await reference.open_read_async()
+            size = int(stream.size)
+            if size <= 0:
+                return None
+            reader = self.DataReader(stream)
+            await reader.load_async(size)
+            buffer = bytearray(size)
+            reader.read_bytes(buffer)
+            return bytes(buffer)
+
+        async def read(self):
+            """Return dict(title, artist, art, playing, pos, dur, url, vol, app).
+
+            Sessions are re-listed on every poll: a cached session object keeps
+            returning its old playback status, so a pause made outside the
+            bridge would never show up on the device.
+            """
+            manager = await self._ensure_manager(force=self._dirty)
+            self._dirty = False
+            session = self._pick(list(manager.get_sessions()))
+            self.session = session
+            if session is None:
+                return None
+
+            props = await session.try_get_media_properties_async()
+            title = (props.title or "Unknown").strip()
+            artist = (props.artist or props.album_artist or "").strip()
+            info = session.get_playback_info()
+            playing = info.playback_status == self.Status.PLAYING
+
+            pos, dur = self._timeline(session, (title, artist), playing)
+
+            # Cover art is a plain byte stream, and it only changes per track:
+            # decoding it on every poll would be 20 PNGs a second.
+            key = (title, artist)
+            if key != self._art_key:
+                self._art_key, self._art = key, None
+                reference = getattr(props, "thumbnail", None)
+                if reference is not None:
+                    try:
+                        self._art = await self._thumbnail(reference)
+                    except Exception as exc:
+                        print("  art read failed:", exc)
+
+            self._pid = self._pid_for(session)
+            return {
+                "title": title,
+                "artist": artist,
+                "art": self._art,
+                "playing": playing,
+                "pos": pos,
+                "dur": dur,
+                "url": "",
+                "vol": self._volume_level(),
+                "app": self.label(session),
+            }
+
+        def _volume_level(self):
+            """Current app volume, sampled twice a second.
+
+            Reading it means a round trip to the volume thread, so it is cached:
+            the level only changes when someone moves a slider or presses a key.
+            """
+            since, level = self._volume_cache
+            if time.monotonic() - since < 0.5:
+                return level
+            level = self._volume.get(self._pid)
+            self._volume_cache = (time.monotonic(), level)
+            return level
+
+        def _timeline(self, session, key, playing):
+            """(position, duration) in seconds, or (0, 0) when the player has none.
+
+            Firefox's SMTC timeline is a snapshot from whenever YouTube Music last
+            published it: the position sits at zero and the total can still be the
+            *previous* track's. So a timeline is only believed once its position
+            has been seen to move during this track; otherwise the bridge falls
+            back to what it does on Linux — count elapsed time itself and look the
+            length up with yt-dlp — rather than show a wrong number.
+            """
+            try:
+                timeline = session.get_timeline_properties()
+                start = timeline.start_time.total_seconds()
+                end = timeline.end_time.total_seconds()
+                raw = max(0.0, timeline.position.total_seconds())
+                dur = max(0, int(end - start)) if end > start else 0
+            except Exception:
+                return 0, 0
+
+            guard = self._guard
+            if key != guard["key"]:
+                guard.update(key=key, pos=raw, trusted=False)
+            elif playing and raw > guard["pos"] + 0.05:
+                guard["pos"], guard["trusted"] = raw, True
+            else:
+                guard["pos"] = raw
+
+            if not guard["trusted"]:
+                return 0, 0
+            return int(raw), dur
+
+        def _pid_for(self, session):
+            row = self.window_for(getattr(session, "source_app_user_model_id", "") or "")
+            return row.pid if row else None
+
+        # ---- commands
+        def _refresh_sink(self):
+            """Where Firefox's media keys should be posted (cached for a moment)."""
+            since, hwnd = self._sink_cache
+            if time.monotonic() - since < WINDOW_CACHE_S:
+                self._sink = hwnd
+                return hwnd
+            hwnd = media_keys_window()
+            if hwnd is None and self.session is not None:
+                row = self.window_for(getattr(self.session, "source_app_user_model_id", "") or "")
+                hwnd = row.hwnd if row else None
+            self._sink_cache = (time.monotonic(), hwnd)
+            self._sink = hwnd
+            return hwnd
+
+        def _is_firefox(self, session):
+            aumid = (getattr(session, "source_app_user_model_id", "") or "").lower()
+            row = self.window_for(aumid)
+            process = (row.process if row else "").lower()
+            return "firefox" in process or "firefox" in self.label(session).lower()
+
+        async def command(self, ch):
+            session = self.session
+            if session is None:
+                return
+            if ch in ("-", "+"):
+                await self.seek(-1 if ch == "-" else +1)
+                return
+
+            if self._is_firefox(session):
+                self._refresh_sink()
+                hwnd = self._sink
+                if hwnd is None:
+                    print(f"  !! command {ch!r}: no Firefox window to address")
+                    return
+                appcommand = {"p": APPCOMMAND_MEDIA_PLAY_PAUSE,
+                              "n": APPCOMMAND_MEDIA_NEXTTRACK,
+                              "b": APPCOMMAND_MEDIA_PREVIOUSTRACK}.get(ch)
+                if appcommand is None:
+                    return
+                self._dirty = True          # state just changed: re-read at once
+                ok = _post_appcommand(hwnd, appcommand)
+                print(f"  <- command {ch!r} -> Firefox WM_APPCOMMAND {appcommand}"
+                      + ("" if ok else " (message dropped)"))
+                return
+
+            method = {"p": "try_toggle_play_pause_async",
+                      "n": "try_skip_next_async",
+                      "b": "try_skip_previous_async"}.get(ch)
+            if method is None:
+                return
+            try:
+                self._dirty = True          # state just changed: re-read at once
+                ok = await getattr(session, method)()
+                print(f"  <- command {ch!r} -> {method} ({'ok' if ok else 'refused'})")
+            except Exception as exc:
+                print(f"  !! command {ch!r} failed: {exc}")
+
+        async def seek(self, direction):
+            """±seek_step. Firefox has no SMTC seek, so it types l/h at the tab."""
+            session = self.session
+            if session is None:
+                return
+            if self._is_firefox(session):
+                row = self._yt_window() or self.window_for(
+                    getattr(session, "source_app_user_model_id", "") or "")
+                if row is None:
+                    print("  !! seek: no Firefox window to address")
+                    return
+                key = VK_L if direction > 0 else VK_H
+                if self._type_at(row, [key]):
+                    print(f"  <- seek {'+' if direction > 0 else '-'}{self.seek_step}s "
+                          f"-> Firefox shortcut {'l' if direction > 0 else 'h'}")
+                return
+
+            try:
+                position = session.get_timeline_properties().position.total_seconds()
+            except Exception:
+                position = 0
+            target = max(0.0, position + direction * self.seek_step)
+            try:
+                # SMTC takes the position as 100 ns ticks, not a timedelta.
+                ok = await session.try_change_playback_position_async(int(target * 10**7))
+                print(f"  <- seek -> {target:.0f}s ({'ok' if ok else 'refused'})")
+            except Exception as exc:
+                print(f"  !! seek failed: {exc}")
+
+        # ---- volume / like
+        def volume(self, sign):
+            level = self._volume.nudge(self._pid, sign)
+            if level is None:
+                print("  !! volume: no audio session for this player")
+            return level
+
+        def _yt_window(self):
+            """The Firefox window that has YouTube Music as its active tab.
+
+            Typing at a window only reaches the *active* tab, so the window is
+            identified by its title: YouTube Music puts the site name there,
+            and while a track plays the tab title carries the track too.
+            """
+            rows = [row for row in self.windows() if "firefox" in row.process.lower()]
+            for row in rows:
+                if "youtube music" in row.title.lower():
+                    return row
+            return None
+
+        def _type_at(self, row, keys, settle=0.35):
+            """Focus a window, type keys at it, then give the focus back.
+
+            Each entry in `keys` is either a virtual-key code to tap, or a
+            (modifier, key) pair sent as a chord.
+            """
+            previous = _user32.GetForegroundWindow()
+            if not set_foreground(row.hwnd):
+                return False
+            try:
+                time.sleep(settle)
+                for key in keys:
+                    if isinstance(key, tuple):
+                        chord(*key)
+                    else:
+                        tap_key(key)
+                    time.sleep(0.05)
+            finally:
+                if previous and previous != row.hwnd:
+                    time.sleep(0.15)
+                    set_foreground(previous)
+            return True
+
+        def like(self):
+            row = self._yt_window()
+            if row is None:
+                return False, "Open the YT Music tab"
+            if not self._type_at(row, [(VK_SHIFT, VK_OEM_PLUS)]):
+                return False, "Like: cannot focus"
+            return True, "Like toggled"
 
 
 # ---------------------------------------------------------------- imaging
@@ -309,9 +1029,13 @@ def do_volume(player, sign):
 _BIT_REVERSED = bytes(int(f"{i:08b}"[::-1], 2) for i in range(256))
 
 
-def art_to_xbm(path, size=ART_SIZE):
-    """Load an image and downscale it to a 1-bit bitmap; returns (w, h, bytes)."""
-    img = Image.open(path).convert("L").resize((size, size), Image.LANCZOS)
+def art_to_xbm(art, size=ART_SIZE):
+    """Downscale cover art to a 1-bit bitmap; returns (w, h, bytes).
+
+    `art` is a file path (MPRIS artUrl) or raw image bytes (SMTC thumbnail).
+    """
+    source = Image.open(io.BytesIO(art)) if isinstance(art, (bytes, bytearray)) else Image.open(art)
+    img = source.convert("L").resize((size, size), Image.LANCZOS)
     img = img.point(lambda v: 255 - v)              # invert: dark pixels -> set bits
     bw = img.convert("1", dither=Image.Dither.FLOYDSTEINBERG)
     return size, size, bytes(_BIT_REVERSED[b] for b in bw.tobytes())
@@ -349,8 +1073,8 @@ def toast_frame(text):
     return frame(FRAME_TOAST, text.encode("utf-8", "replace")[:TOAST_MAX])
 
 
-def art_frame(path):
-    w, h, data = art_to_xbm(path)
+def art_frame(art):
+    w, h, data = art_to_xbm(art)
     return frame(FRAME_ART, bytes([w, h]) + data)
 
 
@@ -381,9 +1105,27 @@ async def send_toast_once(name_hint, text):
         await asyncio.sleep(1.0)
 
 
+async def pair_flipper(name_hint, address_hint=None):
+    """Pair with the Flipper once (Windows needs a bond for the serial profile)."""
+    dev = address_hint or (await find_flipper(name_hint)) or load_known_address()
+    if not dev:
+        sys.exit("no device found — is the Flipper on and advertising?")
+    print(f"Pairing with {dev} ...")
+    async with BleakClient(dev, timeout=CONNECT_TIMEOUT) as client:
+        await client.pair()
+        print("Paired. The bridge can connect now.")
+        save_known_address(getattr(dev, "address", dev))
+
+
 async def find_flipper(name_hint):
     print("Scanning for the Flipper (make sure it's advertising)...")
-    devices = await BleakScanner.discover(timeout=8.0)
+    try:
+        devices = await BleakScanner.discover(timeout=8.0)
+    except Exception as exc:                      # radio off, no adapter, service down
+        # Windows says "Bluetooth radio is not powered on" here; a bridge started
+        # at login can easily beat the radio, so this retries instead of dying.
+        print(f"Bluetooth unavailable: {exc}")
+        return None
     for d in devices:
         nm = d.name or ""
         if name_hint.lower() in nm.lower():
@@ -396,12 +1138,17 @@ async def find_flipper(name_hint):
 
 
 def known_addresses(name_hint):
-    """Addresses BlueZ already knows for this device.
+    """Addresses already known for this device.
 
-    A peripheral that BlueZ still believes is connected stops advertising, so an
+    BlueZ: a peripheral it still believes is connected stops advertising, so an
     empty scan does not mean the Flipper is gone — connecting straight to the
     known address is what makes an always-on bridge recover on its own.
+    Windows keeps that address in a small cache file instead (there is no
+    bluetoothctl to ask), which also skips the scan on a busy radio.
     """
+    if IS_WINDOWS:
+        cached = load_known_address()
+        return [cached] if cached else []
     try:
         out = subprocess.run(["bluetoothctl", "devices"], capture_output=True, text=True)
     except FileNotFoundError:
@@ -428,8 +1175,11 @@ def drop_stale_link(address):
     While BlueZ thinks the Flipper is connected it will not advertise, and
     connecting again just hangs on the dead link — dropping it first is what lets
     the bridge recover unattended, which is the whole point of running it as a
-    service.
+    service. Windows' BLE stack owns the link itself and releases it with the
+    process, so there is nothing to clear there.
     """
+    if IS_WINDOWS:
+        return False
     if "Connected: yes" not in bluetoothctl("info", address):
         return False
     print(f"{address} is still marked connected (stale link); dropping it")
@@ -493,7 +1243,11 @@ def pick_chars(client):
 
 
 async def prepare(client):
-    """Ask BlueZ for the real ATT MTU so writes fit; returns the chunk size."""
+    """Negotiate the ATT MTU so writes fit; returns the chunk size.
+
+    BlueZ needs an explicit _acquire_mtu() (and discovers services first);
+    Windows negotiates on its own and just reports the result through mtu_size.
+    """
     mtu = 23
     acquire = getattr(client, "_acquire_mtu", None)
     if acquire is not None:
@@ -502,6 +1256,11 @@ async def prepare(client):
             mtu = getattr(client, "mtu_size", 23) or 23
         except Exception as e:
             print("  MTU negotiation unavailable:", e)
+    else:
+        try:
+            mtu = int(client.mtu_size) or 23
+        except Exception:
+            mtu = 23
     return max(20, min(WRITE_CHUNK, mtu - 3))
 
 
@@ -556,9 +1315,10 @@ class TrackClock:
 
 
 class Bridge:
-    def __init__(self, player, name_hint, hz=POLL_HZ):
-        self.player = player
+    def __init__(self, backend, name_hint, hz=POLL_HZ, address=None):
+        self.backend = backend
         self.name_hint = name_hint
+        self.address = address
         self.hz = max(1, min(POLL_HZ_MAX, hz))
         self.client = None
         self.write_char = None
@@ -679,8 +1439,9 @@ class Bridge:
             # First sight of this track: date it from Firefox's art file (one
             # stat per track, not per poll). Firefox does NOT always rewrite
             # that file, so a file older than the track itself tells us nothing
-            # — better to start at 0 than to seed a wildly wrong position.
-            age = track_start_age(m["art_path"])
+            # — better to start at 0 than to seed a wildly wrong position. The
+            # Windows backend has no art file, so it simply reports no age.
+            age = track_start_age(m["art"])
             if age is not None and (not m["dur"] or age <= m["dur"]):
                 start_age = age
 
@@ -710,21 +1471,22 @@ class Bridge:
                 self.device_caps = True
                 print("  <- device takes clock-only frames")
             elif ch in CMD_VOLUME:
-                level = await loop.run_in_executor(None, do_volume, self.player, CMD_VOLUME[ch])
+                level = await loop.run_in_executor(
+                    None, self.backend.volume, CMD_VOLUME[ch])
                 if level is None:
                     print(f"  <- volume {ch!r}: player exposes no volume")
                 else:
                     print(f"  <- command {ch!r} -> volume {level}%")
                     await self.send_volume(level)
             elif ch in CMD_TRANSPORT:
-                await loop.run_in_executor(None, do_command, self.player, ch)
+                await self.backend.command(ch)
                 # keep our own clock in step with a seek we just issued
                 if ch == "-":
-                    self.clock.nudge(-SEEK_STEP)
+                    self.clock.nudge(-self.backend.seek_step)
                 elif ch == "+":
-                    self.clock.nudge(SEEK_STEP)
+                    self.clock.nudge(self.backend.seek_step)
             elif ch == CMD_LIKE:
-                ok, message = await loop.run_in_executor(None, toggle_like)
+                ok, message = await loop.run_in_executor(None, self.backend.like)
                 print(f"  <- like: {message}" + ("" if ok else " (nothing typed)"))
                 await self.toast(message)
 
@@ -751,11 +1513,11 @@ class Bridge:
                 print(f"  -> {m['title'][:38]!r} / {m['artist'][:22]!r} "
                       f"{m['pos']}s/{m['dur']}s {'play' if m['playing'] else 'pause'}")
 
-        if m["art_path"] and m["art_path"] != self.last_art:
+        if m["art"] and m["art"] != self.last_art:
             try:
-                blob = art_frame(m["art_path"])
+                blob = art_frame(m["art"])
                 await self.write(blob)
-                self.last_art = m["art_path"]
+                self.last_art = m["art"]
                 print(f"  -> art {len(blob)} bytes")
             except Exception as e:
                 print("  art failed:", e)
@@ -784,6 +1546,8 @@ class Bridge:
 
     async def find_device(self):
         """A scanned device, or the known address if nothing is advertising."""
+        if self.address:
+            return self.address          # pinned with --address: skip the scan
         dev = await find_flipper(self.name_hint)
         if dev:
             return dev
@@ -813,6 +1577,7 @@ class Bridge:
                         await asyncio.sleep(5)
                         continue
                     self.chunk = await prepare(client)
+                    save_known_address(getattr(dev, "address", str(dev)))
                     print(f"Connected. write={self.write_char.uuid} "
                           f"notify={notify_char.uuid} chunk={self.chunk}")
                     await client.start_notify(notify_char, self.on_notify)
@@ -825,7 +1590,7 @@ class Bridge:
                     self.last_text = None
                     self.device_caps = False  # whatever connects must announce again
                     while client.is_connected:
-                        m = read_meta(self.player)
+                        m = await self.backend.read()
                         if m:
                             await self.push(await self.prepare_meta(m))
                         await asyncio.sleep(1.0 / self.hz)
@@ -838,13 +1603,138 @@ class Bridge:
             await asyncio.sleep(3)
 
 
+def is_track_url(url):
+    """True when the URL addresses the track itself rather than just the site.
+
+    Firefox reports the *tab's* URL, and YouTube Music keeps playing while you
+    browse, so it is often only the home page — looking that up gets
+    "Unsupported URL" and the track shows no length.
+    """
+    return bool(url) and ("/watch?" in url or "youtu.be/" in url)
+
+
 # ---------------------------------------------------------------- main
+async def dump_once(bridge, wait=12.0):
+    """Print what the bridge sees, and exit. No Flipper needed.
+
+    It goes through the real pipeline (clock, yt-dlp length lookup), so this is
+    the same numbers the device would be sent — minus the BLE hop.
+    """
+    deadline = time.monotonic() + wait
+    meta = None
+    while time.monotonic() < deadline:
+        meta = await bridge.backend.read()
+        if meta:
+            meta = await bridge.prepare_meta(meta)
+            if meta["dur"]:
+                break            # length resolved, nothing left to wait for
+        await asyncio.sleep(0.5)
+    if not meta:
+        print("No media session found — start playback first.")
+        return 1
+
+    print(f"app      : {meta['app'] or '?'}")
+    print(f"title    : {meta['title']}")
+    print(f"artist   : {meta['artist'] or '?'}")
+    print(f"state    : {'playing' if meta['playing'] else 'paused'}")
+    print(f"position : {meta['pos']}s")
+    print(f"length   : {meta['dur']}s" + ("" if meta["dur"] else "  (unknown)"))
+    print(f"volume   : {'?' if meta['vol'] is None else str(meta['vol']) + '%'}")
+    print(f"art      : {'none' if not meta['art'] else 'yes'}")
+
+    if meta["art"]:
+        try:
+            w, h, data = art_to_xbm(meta["art"])
+            out = Path(os.environ.get("TEMP", ".")) / "ytm-art.xbm.bin"
+            out.write_bytes(data)
+            print(f"art xbm  : {w}x{h}, {len(data)} bytes -> {out}")
+        except Exception as exc:
+            print("art convert failed:", exc)
+    return 0
+
+
+async def main_async(args):
+    if args.list:
+        if IS_WINDOWS:
+            backend = WindowsBackend(args.player)
+            rows = await backend.list()
+            if not rows:
+                print("No media sessions — start playback in Firefox/YouTube Music first.")
+            for row in rows:
+                print(row)
+            return 0
+        mpris = MprisBackend(args.player)
+        for player in mpris.list():
+            print(player)
+        return 0
+
+    if args.toast:
+        await send_toast_once(args.name, args.toast)
+        return 0
+
+    if args.pair:
+        await pair_flipper(args.name, args.address)
+        return 0
+
+    if IS_WINDOWS:
+        backend = WindowsBackend(args.player)
+    else:
+        player = args.player
+        if not player:
+            mpris = MprisBackend(None)
+            players = mpris.list()
+            waited = getattr(args, "wait_for_player", False)
+            while not players and waited:
+                print("Waiting for a media player (start YouTube Music)...")
+                time.sleep(5)
+                players = mpris.list()
+            if not players:
+                sys.exit("No MPRIS players found — start YouTube Music / a video first.")
+            player = players[0]
+            print("Using player:", player)
+        backend = MprisBackend(player)
+
+    if args.cmd:
+        if args.cmd not in ("p", "n", "b", "-", "+", "u", "d", "l"):
+            sys.exit("--cmd takes one of p n b - + u d l")
+        meta = await backend.read()
+        if meta is None:
+            sys.exit("No media session found — start playback first.")
+        print(f"player: {meta['app'] or '?'} — {meta['title']} / {meta['artist']}")
+        if args.cmd in CMD_VOLUME:
+            level = backend.volume(CMD_VOLUME[args.cmd])
+            print("volume:", "unavailable" if level is None else f"{level}%")
+        elif args.cmd == "l":
+            ok, message = backend.like()
+            print("like:", message, "" if ok else "(nothing typed)")
+        else:
+            await backend.command(args.cmd)
+        return 0
+
+    if args.dump:
+        return await dump_once(Bridge(backend, args.name, args.hz, args.address))
+
+    bridge = Bridge(backend, args.name, args.hz, args.address)
+    print(f"Polling at {bridge.hz:g} Hz")
+    await bridge.run()
+    return 0
+
+
 def main():
+    # Line-buffered output: run as a service (or with its log redirected to a
+    # file) a block-buffered stdout would hide the log for minutes.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+
     ap = argparse.ArgumentParser(description="Flipper YT Music Remote bridge")
-    ap.add_argument("--player", help="MPRIS player name (default: auto)")
+    ap.add_argument("--player",
+                    help="MPRIS player name (Linux) / app name, exe or AUMID substring "
+                         "(Windows, e.g. firefox); default: auto")
     ap.add_argument("--name", default=os.environ.get("FLIPPER_NAME", "Flipper"),
                     help="BLE name substring of your Flipper")
-    ap.add_argument("--list", action="store_true", help="list players and exit")
+    ap.add_argument("--list", action="store_true", help="list media players and exit")
     ap.add_argument("--hz", type=float, default=POLL_HZ,
                     help=f"metadata pushes per second (default {POLL_HZ}, max {POLL_HZ_MAX})")
     ap.add_argument("--toast", metavar="TEXT",
@@ -853,33 +1743,18 @@ def main():
     ap.add_argument("--wait-for-player", action="store_true",
                     help="sit and wait for a media player instead of exiting "
                          "(for running as a service from login)")
+    ap.add_argument("--dump", action="store_true",
+                    help="print the track the bridge would send, then exit "
+                         "(no Flipper needed — good first check)")
+    ap.add_argument("--cmd", metavar="KEY",
+                    help="send one device command and exit: p n b - + u d l")
+    ap.add_argument("--pair", action="store_true",
+                    help="pair with the Flipper and exit (Windows: pair once before first use)")
+    ap.add_argument("--address", help="connect to this BLE address instead of scanning")
     args = ap.parse_args()
 
-    if args.list:
-        for p in list_players():
-            print(p)
-        return
-
-    if args.toast:
-        asyncio.run(send_toast_once(args.name, args.toast))
-        return
-
-    player = args.player
-    if not player:
-        players = list_players()
-        while not players and args.wait_for_player:
-            print("Waiting for a media player (start YouTube Music)...")
-            time.sleep(5)
-            players = list_players()
-        if not players:
-            sys.exit("No MPRIS players found — start YouTube Music / a video first.")
-        player = players[0]
-        print("Using player:", player)
-
-    bridge = Bridge(player, args.name, args.hz)
-    print(f"Polling at {bridge.hz:g} Hz")
     try:
-        asyncio.run(bridge.run())
+        sys.exit(asyncio.run(main_async(args)) or 0)
     except KeyboardInterrupt:
         print("\nbye")
 

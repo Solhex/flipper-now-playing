@@ -16,7 +16,7 @@ two exchange raw byte frames.
 |------------------|-----------------------------------------------------------|
 | `ytm_remote.c`   | Flipper app: parses frames, draws screen, sends commands  |
 | `application.fam`| Manifest (`requires=["bt"]`, category `Bluetooth`)        |
-| `ytm_bridge.py`  | PC side: MPRIS metadata -> BLE, commands -> `playerctl`   |
+| `ytm_bridge.py`  | PC side: media session -> BLE, buttons -> the player       |
 
 ## Build and flash
 
@@ -46,6 +46,52 @@ python3 ytm_bridge.py --name Gumi --hz 15  # push metadata 15x/second (default 2
 Requires `bleak` and `pillow` (`pip install bleak pillow`) and `playerctl`.
 On the Flipper: launch **YT Music Remote** (Apps -> Bluetooth) and make sure
 Bluetooth is ON.
+
+### Windows
+
+The Flipper app is the same build. The PC side reads Windows' own media session —
+the one behind the volume flyout and the media keys — instead of MPRIS, so
+Firefox and YouTube Music behave the way they do on Linux.
+
+```bat
+py -3 -m venv .venv
+.venv\Scripts\pip install -r requirements-windows.txt
+.venv\Scripts\python ytm_bridge.py --list     :: what Windows is playing right now
+.venv\Scripts\python ytm_bridge.py --dump     :: the exact numbers that would go to the Flipper
+.venv\Scripts\python ytm_bridge.py --pair     :: pair the Flipper once (Windows needs a bond)
+.venv\Scripts\python ytm_bridge.py --name Gumi --player firefox
+```
+
+`--dump` and `--cmd` (one button, e.g. `--cmd p`) need no Flipper, which is the
+quickest way to tell a bridge problem from a device problem. On the Flipper:
+launch **YT Music Remote** (Apps -> Bluetooth), Bluetooth ON.
+
+The pieces differ underneath:
+
+| | Linux | Windows |
+|---|---|---|
+| media source | MPRIS via `playerctl` | Windows media sessions (WinRT / SMTC) |
+| extra dependencies | `playerctl`, `yt-dlp` | `winrt-Windows.Media.Control`, `pycaw`, `yt-dlp` |
+| play / pause / skip | `playerctl` | `WM_APPCOMMAND` posted at the browser window |
+| volume | the player's own volume | that app's slider in the Windows mixer |
+| pairing | BlueZ bond | `--pair` once, or Settings -> Bluetooth |
+
+Firefox is why two of those rows exist. It publishes a Windows media session, so
+title, artist and cover art arrive for free — but it ignores the session's
+play/pause/next methods (they return "ok" and do nothing), so the bridge posts the
+same `WM_APPCOMMAND` messages the media keys produce directly to the browser
+window, which it does act on. It also reports no playback position for YouTube
+Music, and its timeline can still carry the *previous* track's length, so the
+bridge times the track itself (as on Linux) and only trusts a timeline once it has
+seen the position move. Length still comes from `yt-dlp`, so without it the total
+and the progress bar stay empty.
+
+Two Windows-only consequences worth knowing:
+
+- **Seek is ±10 s per press**, not 5 s: Firefox has no seek API, so the bridge
+  types YouTube Music's own `l`/`h` shortcut at the tab.
+- **Volume keys move that app's slider**, not a player-internal volume, and need
+  `pycaw`; without it they are ignored (`Volume keys disabled` on startup).
 
 ## Track screen
 
@@ -123,6 +169,18 @@ The unit lives at `~/.config/systemd/user/ytm-remote.service` and runs the bridg
 from a dedicated venv at `~/.local/share/ytm-remote/venv`, so it doesn't depend on
 any other Python install on the machine.
 
+On Windows put a shortcut in `shell:startup` (`Win+R` -> `shell:startup`) or a
+Task Scheduler job that runs at log on:
+
+```bat
+C:\path\to\.venv\Scripts\python.exe C:\path\to\ytm_bridge.py --name Gumi --player firefox --wait-for-player
+```
+
+A plain `python.exe` keeps a console window (and the log) around; swap in
+`pythonw.exe` to hide it, and read `%LOCALAPPDATA%\ytm-remote\status.json`
+instead. There is no stale-link step on Windows — the BLE stack releases the link
+with the process — so the bridge just rescans, then retries the cached address.
+
 ## Settings menu (Back)
 
 | Row       | Controls                                              |
@@ -140,8 +198,9 @@ right after the track changed.
 
 ## Like (hold OK)
 
-MPRIS has no like action, so this types YouTube Music's own shortcut (`shift+=`)
-at the browser. That has consequences worth knowing:
+Neither MPRIS nor the Windows media session has a like action, so this types
+YouTube Music's own shortcut (`shift+=`) at the browser. That has consequences
+worth knowing:
 
 - **The YouTube Music tab has to be the one on screen.** A window's title is its
   active tab's title, so the bridge looks for a window named "… - YouTube Music",
@@ -149,7 +208,9 @@ at the browser. That has consequences worth knowing:
   matches it does *nothing* and says so — firing blind would type a `+` into
   whatever else you have focused. Either way the device shows a toast with the
   result (`Like toggled` / `Open the YT Music tab`).
-- It needs `swaymsg` to check the focused window, and **`vkkey`** to type: a small
+- On Windows the same keystroke is sent with `SendInput` after raising the
+  browser window, and focus goes back to what you were using afterwards.
+- On Linux it needs `swaymsg` to check the focused window, and **`vkkey`** to type: a small
   Wayland virtual-keyboard client at `~/.local/share/ytm-remote/bin/vkkey`, built
   from `src/vkkey.c` in that directory against `wayland-client` + `xkbcommon`
   (rebuild with `wayland-scanner` + `gcc`, no root needed). It uses
@@ -217,6 +278,14 @@ redrawing the screen.
 - **First write fails with `0x0E Unlikely Error`.** The serial profile is still
   coming up; the bridge retries with backoff and settles.
 - **Wrong BLE name.** Pass `--name <substring>` or set `FLIPPER_NAME`.
+- **`Bluetooth unavailable: Bluetooth radio is not powered on`.** Windows has the
+  radio switched off (or a bridge started before the adapter came up). The bridge
+  retries every few seconds; nothing else to do.
+- **The Flipper is listed but connecting fails on Windows.** The serial profile
+  expects a bonded device: run `ytm_bridge.py --pair` once, or pair it in
+  Settings -> Bluetooth. `--pair` also works on Linux.
+- **Windows: volume keys do nothing.** `pycaw` is not installed, or that app has
+  no audio session yet (nothing has played since it started).
 - **Buttons do nothing while metadata streams fine.** Check the
   `Connected. write=… notify=…` line: `notify` must be `…228e61fe0000`
   (the indicate-only TX char). Pointing it at the flow-control char `…228e63…`
