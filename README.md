@@ -17,6 +17,7 @@ two exchange raw byte frames.
 | `ytm_remote.c`   | Flipper app: parses frames, draws screen, sends commands  |
 | `application.fam`| Manifest (`requires=["bt"]`, category `Bluetooth`)        |
 | `ytm_bridge.py`  | PC side: media session -> BLE, buttons -> the player       |
+| `windows_startup.py` | Windows: registers the bridge to start at logon        |
 
 ## Build and flash
 
@@ -169,17 +170,26 @@ The unit lives at `~/.config/systemd/user/ytm-remote.service` and runs the bridg
 from a dedicated venv at `~/.local/share/ytm-remote/venv`, so it doesn't depend on
 any other Python install on the machine.
 
-On Windows put a shortcut in `shell:startup` (`Win+R` -> `shell:startup`) or a
-Task Scheduler job that runs at log on:
+On Windows the same idea is one command — it writes a shortcut into your Startup
+folder, so the bridge comes up at logon with no console window and no
+administrator rights:
 
 ```bat
-C:\path\to\.venv\Scripts\python.exe C:\path\to\ytm_bridge.py --name Gumi --player firefox --wait-for-player
+.venv\Scripts\python windows_startup.py install --name Gumi
+.venv\Scripts\python windows_startup.py status        :: what it runs, and the log tail
+.venv\Scripts\python windows_startup.py uninstall
 ```
 
-A plain `python.exe` keeps a console window (and the log) around; swap in
-`pythonw.exe` to hide it, and read `%LOCALAPPDATA%\ytm-remote\status.json`
-instead. There is no stale-link step on Windows — the BLE stack releases the link
-with the process — so the bridge just rescans, then retries the cached address.
+The shortcut runs `pythonw.exe`, so nothing appears on screen; the bridge appends
+its usual lines to `%LOCALAPPDATA%\ytm-remote\bridge.log` (that is what
+`--log` is for — `pythonw.exe` has no stdout at all), and keeps
+`status.json` beside it. Extra bridge options go through
+`--args "--player firefox --hz 15"`.
+
+There is no stale-link step on Windows — the BLE stack releases the link with the
+process — so the bridge just rescans, then retries the cached address. If it
+starts before the Bluetooth radio is up it says so and retries, rather than
+exiting.
 
 ## Settings menu (Back)
 
@@ -286,6 +296,10 @@ redrawing the screen.
   Settings -> Bluetooth. `--pair` also works on Linux.
 - **Windows: volume keys do nothing.** `pycaw` is not installed, or that app has
   no audio session yet (nothing has played since it started).
+- **Windows: nothing happens after logging in.** `windows_startup.py status`
+  prints the exact command and the end of `bridge.log`; a bridge that was started
+  hidden is otherwise invisible. If the log is empty, the shortcut's `pythonw.exe`
+  path moved (reinstall after recreating the venv).
 - **Buttons do nothing while metadata streams fine.** Check the
   `Connected. write=… notify=…` line: `notify` must be `…228e61fe0000`
   (the indicate-only TX char). Pointing it at the flow-control char `…228e63…`

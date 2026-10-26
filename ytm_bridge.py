@@ -1743,14 +1743,28 @@ async def main_async(args):
     return 0
 
 
-def main():
-    # Line-buffered output: run as a service (or with its log redirected to a
-    # file) a block-buffered stdout would hide the log for minutes.
-    try:
-        sys.stdout.reconfigure(line_buffering=True)
-    except Exception:
-        pass
+def setup_log(path, max_bytes=2_000_000):
+    """Send everything this process prints to a file, for a console-less start.
 
+    Started from a Startup shortcut (pythonw.exe) there is no stdout at all, so
+    prints would either vanish or crash. Appending to a file keeps the same
+    messages the console build shows; it is rotated once when it grows too big so
+    a machine that has been up for weeks does not carry a huge log.
+    """
+    target = Path(path).expanduser()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        if target.exists() and target.stat().st_size > max_bytes:
+            target.replace(target.with_name(target.name + ".1"))
+    except OSError:
+        pass
+    handle = open(target, "a", encoding="utf-8", errors="replace", buffering=1)
+    sys.stdout = handle
+    sys.stderr = handle
+    return handle
+
+
+def main():
     ap = argparse.ArgumentParser(description="Flipper YT Music Remote bridge")
     ap.add_argument("--player",
                     help="MPRIS player name (Linux) / app name, exe or AUMID substring "
@@ -1774,7 +1788,19 @@ def main():
     ap.add_argument("--pair", action="store_true",
                     help="pair with the Flipper and exit (Windows: pair once before first use)")
     ap.add_argument("--address", help="connect to this BLE address instead of scanning")
+    ap.add_argument("--log", metavar="PATH",
+                    help="append all output to this file instead of the console "
+                         "(for starting hidden at login)")
     args = ap.parse_args()
+
+    if args.log:
+        setup_log(args.log)
+    # Line-buffered output: run as a service (or with its output in a file) a
+    # block-buffered stdout would hide the log for minutes.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
 
     try:
         sys.exit(asyncio.run(main_async(args)) or 0)
