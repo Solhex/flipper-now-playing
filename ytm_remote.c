@@ -777,10 +777,10 @@ static void draw_now_playing(Canvas* canvas, App* app) {
      * news rather than decoration. */
     if(app->liked == 1) {
         int hx = 64 - HEART_W / 2;
-        /* Bottom-aligned with the time digits: the last row of the screen is the
-         * baseline the elapsed/total text sits on, so the heart ends level with
-         * it instead of floating just under the bar. */
-        int hy = 63 - HEART_H + 1;
+        /* Two rows above the digit baseline (row 63 they sit on): level with the
+         * bar looked too high, level with the digits too low — this sits in
+         * between, in the gap the time row leaves in the middle. */
+        int hy = 63 - HEART_H - 1;
         canvas_draw_xbm(canvas, hx, hy, HEART_W, HEART_H, HEART_BITS);
     }
 
