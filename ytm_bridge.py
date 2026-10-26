@@ -52,8 +52,11 @@ IS_WINDOWS = sys.platform == "win32"
 # ---- tunables ----
 ART_SIZE = 44          # px, square; the largest cover that still leaves a row
                        # between it and the bar (64 rows: cover 44 + bar 7 + time 8)
-SEEK_STEP = 5          # seconds per seek tap (MPRIS players)
-SEEK_STEP_WIN = 10     # seconds per seek tap on Windows: YT Music's l/h shortcut
+# Seconds per seek tap, the same everywhere. Firefox offers no seek API, only
+# YouTube Music's own shortcuts (l/h = 10 s), so 10 s is the one step every
+# platform can actually honour — a device that promises 5 s and jumps 10 would be
+# lying on Windows.
+SEEK_STEP = 10
 VOLUME_STEP = 0.05     # fraction of full scale per volume key press
 POLL_HZ = 20           # metadata pushes per second (override with --hz)
 POLL_HZ_MAX = 25
@@ -323,6 +326,15 @@ class BrowserLink:
                 else:
                     self._reply(200, json.dumps(link.state()).encode())
 
+            def handle_one_request(self):
+                # The extension aborts its 20 s poll when the worker restarts, so
+                # a reset here is routine; the stock handler prints a traceback
+                # for it and fills the log.
+                try:
+                    super().handle_one_request()
+                except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+                    self.close_connection = True
+
             def log_message(self, format, *args):
                 pass                        # a poll every second is not news
 
@@ -336,8 +348,18 @@ class BrowserLink:
             print(f"Using the running bridge on port {self.port} for the like state")
             return True
 
+        class Server(ThreadingHTTPServer):
+            # Same reason as handle_one_request: a client hanging up is routine.
+            def handle_error(self, request, client_address):
+                import sys as _sys
+                exc = _sys.exc_info()[1]
+                if isinstance(exc, (ConnectionResetError, ConnectionAbortedError,
+                                    BrokenPipeError)):
+                    return
+                super().handle_error(request, client_address)
+
         try:
-            server = ThreadingHTTPServer(("127.0.0.1", self.port), Handler)
+            server = Server(("127.0.0.1", self.port), Handler)
         except OSError as exc:
             # The port is taken — almost always by an already-running bridge. Then
             # this process is a helper (--dump, --cmd) and asks *that* one instead
@@ -1113,7 +1135,7 @@ if IS_WINDOWS:
         """
 
         name = "smtc"
-        seek_step = SEEK_STEP_WIN
+        seek_step = SEEK_STEP
 
         def __init__(self, hint=None, firefox_port=None, link=None):
             self.link = link

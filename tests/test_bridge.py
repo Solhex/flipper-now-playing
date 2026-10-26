@@ -183,9 +183,10 @@ class MprisParsingTests(unittest.TestCase):
         self.assertEqual(meta["pos"], 0)
         self.assertFalse(meta["playing"])
 
-    def test_seek_step_is_five_seconds_on_mpris(self):
-        self.assertEqual(y.MprisBackend.seek_step, 5)
-        self.assertEqual(y.SEEK_STEP, 5)
+    def test_seek_step_is_ten_seconds_everywhere(self):
+        # YouTube Music's own shortcuts step 10 s, so the device must not claim 5
+        self.assertEqual(y.SEEK_STEP, 10)
+        self.assertEqual(y.MprisBackend.seek_step, y.SEEK_STEP)
 
 
 class TrackUrlTests(unittest.TestCase):

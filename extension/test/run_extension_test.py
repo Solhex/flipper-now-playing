@@ -14,7 +14,10 @@ import time
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-EXT_SRC = Path(r"C:\Users\fvern\flipper-now-playing\extension")
+# Which build to load: the working source by default, or a packaged one, e.g.
+#   python extension/test/run_extension_test.py 30 extension/dist/chrome
+ROOT = Path(__file__).resolve().parent
+EXT_SRC = Path(sys.argv[2]) if len(sys.argv) > 2 else (ROOT.parent)
 PAGE_PORT = 8099
 BROWSERS = [
     r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
@@ -24,7 +27,8 @@ BROWSERS = [
 
 
 def serve_pages():
-    handler = lambda *a, **k: SimpleHTTPRequestHandler(*a, directory=str(EXT_SRC / "test"), **k)
+    pages = ROOT / "test"          # the mock page, not the build being tested
+    handler = lambda *a, **k: SimpleHTTPRequestHandler(*a, directory=str(pages), **k)
     server = ThreadingHTTPServer(("127.0.0.1", PAGE_PORT), handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return server
@@ -34,6 +38,8 @@ def build_test_extension():
     folder = Path(tempfile.mkdtemp(prefix="ytm-ext-test-"))
     for name in ("manifest.json", "content.js", "background.js"):
         shutil.copy(EXT_SRC / name, folder / name)
+    if (EXT_SRC / "icons").is_dir():
+        shutil.copytree(EXT_SRC / "icons", folder / "icons")
     manifest = json.loads((folder / "manifest.json").read_text())
     manifest["host_permissions"].append(f"http://127.0.0.1:{PAGE_PORT}/*")
     manifest["content_scripts"][0]["matches"].append(f"http://127.0.0.1:{PAGE_PORT}/*")

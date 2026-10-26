@@ -27,23 +27,36 @@ async function postState(payload) {
   }
 }
 
-/* Sent to every tab rather than filtered by URL: only tabs running the content
- * script have the listener, and a URL pattern would miss a page whose URL differs
- * from the shipped match (a test page, a redirect, another host).
+/* Exactly one tab gets the toggle: two YouTube Music tabs both clicking would
+ * like and then unlike in the same breath, so the state would never change.
  *
- * Nothing here is awaited: `tabs.sendMessage` to a tab with no listener can leave
- * its promise unsettled, and awaiting that inside the poll loop stopped every
- * later command from ever being delivered. */
+ * Tabs are tried in order of likely relevance (audible first, then the active
+ * one) and the first one that accepts the message wins — a tab without the
+ * content script rejects it, which is how the right tab is found without
+ * trusting a URL match. Nothing waits on a rejected promise, because an
+ * unsettled `sendMessage` inside the poll loop used to stall every later
+ * command. */
 function forwardToggle() {
   chrome.tabs.query({}).then((tabs) => {
-    for (const tab of tabs) {
+    const ranked = [...tabs].sort((a, b) => {
+      const score = (tab) => (tab.audible ? 2 : 0) + (tab.active ? 1 : 0);
+      return score(b) - score(a);
+    });
+    const tryNext = (index) => {
+      if (index >= ranked.length) return;
+      const tab = ranked[index];
+      let sent;
       try {
-        const sent = chrome.tabs.sendMessage(tab.id, { type: "toggle" });
-        if (sent && typeof sent.catch === "function") sent.catch(() => {});
+        sent = chrome.tabs.sendMessage(tab.id, { type: "toggle" });
       } catch (error) {
-        /* tab went away mid-send */
+        tryNext(index + 1);
+        return;
       }
-    }
+      if (sent && typeof sent.then === "function") {
+        sent.then(() => {}).catch(() => tryNext(index + 1));
+      }
+    };
+    tryNext(0);
   }).catch(() => {});
 }
 

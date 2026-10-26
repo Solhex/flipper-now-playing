@@ -5,3 +5,5 @@ dist/
 windows-support.patch
 .venv/
 .buildenv/
+
+extension/dist/

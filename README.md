@@ -19,6 +19,8 @@ two exchange raw byte frames.
 | `ytm_bridge.py`  | PC side: media session -> BLE, buttons -> the player       |
 | `windows_startup.py` | Windows: registers the bridge to start at logon        |
 | `extension/`     | browser add-on: like state -> bridge, bridge -> click  |
+| `extension/build.py` | packages it for Firefox (.xpi) and Chromium (.zip) |
+| `tests/`         | unit tests: frames, art, clock, MPRIS parsing, protocol |
 
 ## Build and flash
 
@@ -95,8 +97,9 @@ and the progress bar stay empty.
 
 Two Windows-only consequences worth knowing:
 
-- **Seek is ±10 s per press**, not 5 s: Firefox has no seek API, so the bridge
-  types YouTube Music's own `l`/`h` shortcut at the tab.
+- **Seek is ±10 s per press on every platform.** Firefox has no seek API at all,
+  so it types YouTube Music's own `l`/`h` shortcuts, and those step 10 s — which
+  is why the device advertises 10 s rather than a step Windows cannot honour.
 - **Volume keys move that app's slider**, not a player-internal volume, and need
   `pycaw`; without it they are ignored (`Volume keys disabled` on startup).
 
@@ -119,8 +122,8 @@ An unknown track length shows as `--:--` rather than a wrong `0:00`.
 | OK (hold)     | like / unlike the track    |
 | Up            | tap: volume up · hold (~0.3 s): next track      |
 | Down          | tap: volume down · hold (~0.3 s): previous track |
-| Left          | seek back 5 s              |
-| Right         | seek forward 5 s           |
+| Left          | seek back 10 s             |
+| Right         | seek forward 10 s          |
 | Back (short)  | settings menu              |
 | Back (long)   | exit the app               |
 
@@ -229,12 +232,33 @@ button is held, the bridge answers the extension's long poll and the extension
 **clicks the real button**. No browser launch flags, no debug port, and the same
 folder runs in every Chromium browser.
 
+Packaging it is one command — one source, two manifests, because Chrome and
+Firefox disagree about how a Manifest V3 background script is declared:
+
+```bash
+python extension/build.py
+#   extension/dist/ytm-bridge-1.0.0-firefox.xpi   (+ unpacked in dist/firefox)
+#   extension/dist/ytm-bridge-1.0.0-chrome.zip    (+ unpacked in dist/chrome)
+```
+
 - **Chrome / Edge**: `chrome://extensions` -> Developer mode -> *Load unpacked* ->
-  pick the `extension` folder.
-- **Firefox**: `about:debugging#/runtime/this-firefox` -> *Load Temporary
-  Add-on* -> pick `extension/manifest.json`. Firefox only keeps temporary add-ons
-  for the session unless the file is signed, so for a permanent setup either sign
-  it or use option 2 below.
+  `extension/dist/chrome` (or the `extension` folder itself).
+- **Firefox, temporary**: `about:debugging#/runtime/this-firefox` -> *Load
+  Temporary Add-on* -> `extension/dist/firefox/manifest.json`. Firefox drops it
+  when the browser closes.
+- **Firefox, permanent**: the `.xpi` has to be signed. Either submit it on
+  addons.mozilla.org, or sign it in one step from your own account (the keys are
+  your credentials — export them, never paste them anywhere):
+
+  ```bash
+  export AMO_JWT_ISSUER=...   AMO_JWT_SECRET=...
+  npx web-ext sign --source-dir extension/dist/firefox \
+      --api-key "$AMO_JWT_ISSUER" --api-secret "$AMO_JWT_SECRET" --channel unlisted
+  ```
+
+  then `about:addons` -> gear -> *Install Add-on From File…*. `npx web-ext lint
+  --source-dir extension/dist/firefox` reports 0 errors (one warning: the add-on
+  is declared desktop-only, because there is no bridge on Android to talk to).
 
 Check it with the bridge's own endpoints:
 
@@ -250,9 +274,11 @@ The state is labelled `(browser extension)` in `--dump` when that is where it ca
 from.
 
 `extension/test/` holds the harness used to verify this: a mock page with the
-site's like-button DOM, and a script that loads the extension into a headless
-Chromium browser and drives the bridge
-(`python extension/test/run_extension_test.py 50`).
+site's like-button DOM, and a script that loads the extension (working copy or a
+packaged build) into a headless Chromium browser and drives the bridge
+(`python extension/test/run_extension_test.py 50 [extension/dist/chrome]`). It
+talks to the *running* bridge, so stop the bridge first if you want the test's
+own state to be the one you read back.
 
 ### 2. Firefox's own debug port
 

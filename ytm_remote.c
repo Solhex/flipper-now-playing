@@ -17,6 +17,8 @@
  *
  * Commands, Flipper -> PC: one byte each (CMD_TRANSPORT/CMD_VOLUME in ytm_bridge.py)
  *   'p' play/pause   'n' next   'b' previous   '-' seek back   '+' seek forward
+ *   (the PC decides the step: 10 s, because that is what YouTube Music's own
+ *    shortcuts offer and Firefox exposes no seek API at all)
  *   'u' volume up    'd' volume down
  *
  * Controls
@@ -804,7 +806,7 @@ static void draw_help(Canvas* canvas, App* app) {
         "OK         play / pause",
         "OK hold    like / unlike",
         "Up/Down    volume / skip",
-        "Left/Right seek 5 s",
+        "Left/Right seek 10 s",
         "Back       this menu",
         "Back hold  exit app",
     };
