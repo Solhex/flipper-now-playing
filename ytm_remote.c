@@ -203,17 +203,11 @@ struct App {
     uint32_t vol_until; /* tick until which the overlay is drawn */
     bool vol_clear_pending; /* still owe one redraw to erase the overlay */
 
-    /* Layout/marquee snapshot for host-side checking: the draw callback fills the
-     * text (only it has the canvas) and the app loop writes the file, because
-     * storage I/O under the GUI lock is asking for trouble. */
-    bool dump_pending;
-    char dump_text[192];
-
     char toast[TOAST_MAX + 1]; /* last message from the PC (e.g. the like result) */
     uint32_t toast_until;
     bool toast_clear_pending;
     bool help_open; /* the key-bind page is up, over the settings menu */
-    bool diag_open; /* the diagnostics page (layout + marquee numbers) */
+    uint8_t top; /* first visible settings row (the list scrolls) */
 
     Bt* bt;
     FuriHalBleProfileBase* ble;
@@ -341,14 +335,7 @@ static void cfg_save(App* app) {
 
 /* ---------------- settings menu ---------------- */
 
-typedef enum {
-    SettingBacklight,
-    SettingStayOn,
-    SettingKeys,
-    SettingDiag,
-    SettingExit,
-    SettingCount
-} SettingRow;
+typedef enum { SettingBacklight, SettingStayOn, SettingKeys, SettingExit, SettingCount } SettingRow;
 
 typedef enum { ActStep, ActToggle, ActInfo, ActQuit } ActKind;
 
@@ -363,11 +350,16 @@ static const SettingDef SETTINGS[SettingCount] = {
     {ActStep, "Backlight"},
     {ActToggle, "Stay on"},
     {ActInfo, "Key binds"},
-    {ActInfo, "Diagnostics"},
     {ActQuit, "Exit app"},
 };
 
-#define SETTINGS_ROW_Y 16 /* five rows now: 16,27,38,49,60 — must fit in 64 */
+/* Three rows fit under the title with the footer still legible (glyphs are 11 px
+ * tall); the rest scroll, with a bar on the right so it is obvious there is more.
+ * Five rows at 11 px spacing overlapped the title and the footer. */
+#define SETTINGS_ROW_Y    20 /* first visible row's baseline */
+#define SETTINGS_ROW_STEP 12 /* 11 px glyphs plus a 1 px gap */
+#define SETTINGS_VISIBLE  3
+#define SETTINGS_BAR_X    124 /* scroll bar track x, 3 px wide */
 
 static void settings_value(App* app, SettingRow row, char* out, size_t n) {
     switch(SETTINGS[row].kind) {
@@ -407,10 +399,7 @@ static void settings_act(App* app, int dir) {
         cfg_save(app);
         break;
     case ActInfo:
-        if(dir == 0) {
-            if(row == SettingKeys) app->help_open = true;
-            else if(row == SettingDiag) app->diag_open = true;
-        }
+        if(dir == 0) app->help_open = true; /* the key-bind page */
         break;
     case ActQuit:
         if(dir == 0) app->running = false;
@@ -421,6 +410,7 @@ static void settings_act(App* app, int dir) {
 static void settings_open_view(App* app) {
     app->settings_open = true;
     app->sel = SettingBacklight;
+    app->top = 0;
     /* the menu must stay readable even with "Stay on" turned off */
     if(!app->held) {
         backlight_hold(app, true);
@@ -440,9 +430,11 @@ static void settings_key(App* app, InputEvent* event) {
     switch(event->key) {
     case InputKeyUp:
         if(app->sel > 0) app->sel--;
+        if(app->sel < app->top) app->top = app->sel; /* scroll to follow it */
         break;
     case InputKeyDown:
         if(app->sel < SettingCount - 1) app->sel++;
+        if(app->sel >= app->top + SETTINGS_VISIBLE) app->top = app->sel - SETTINGS_VISIBLE + 1;
         break;
     case InputKeyLeft:
         settings_act(app, -1);
@@ -505,12 +497,9 @@ static void input_callback(InputEvent* event, void* context) {
         return; /* Press/Release carry no action of their own */
     }
 
-    if(app->help_open || app->diag_open) {
-        /* a reference page: any of Back/OK returns to the menu */
-        if(event->key == InputKeyBack || event->key == InputKeyOk) {
-            app->help_open = false;
-            app->diag_open = false;
-        }
+    if(app->help_open) {
+        /* the key-bind page: any of Back/OK returns to the menu */
+        if(event->key == InputKeyBack || event->key == InputKeyOk) app->help_open = false;
         view_port_update(app->vp);
         return;
     }
@@ -622,20 +611,35 @@ static void draw_settings(Canvas* canvas, App* app) {
     canvas_draw_str(canvas, 2, 9, "Settings");
     canvas_set_font(canvas, FontSecondary);
 
-    for(uint8_t i = 0; i < SettingCount; i++) {
-        int y = SETTINGS_ROW_Y + i * 11;
+    for(uint8_t j = 0; j < SETTINGS_VISIBLE; j++) {
+        uint8_t i = app->top + j;
+        if(i >= SettingCount) break;
+        int y = SETTINGS_ROW_Y + j * SETTINGS_ROW_STEP;
         char value[24];
         settings_value(app, i, value, sizeof(value));
 
         if(i == app->sel) {
-            canvas_draw_box(canvas, 0, y - 9, 128, 11);
+            canvas_draw_box(canvas, 0, y - 10, SETTINGS_BAR_X - 2, SETTINGS_ROW_STEP);
             canvas_set_color(canvas, ColorWhite);
         }
         canvas_draw_str(canvas, 3, y, SETTINGS[i].label);
         if(value[0]) {
-            canvas_draw_str_aligned(canvas, 125, y, AlignRight, AlignBottom, value);
+            canvas_draw_str_aligned(canvas, SETTINGS_BAR_X - 6, y, AlignRight, AlignBottom, value);
         }
         canvas_set_color(canvas, ColorBlack);
+    }
+
+    /* Scroll bar, only when the list does not fit — a full-height bar would
+     * suggest scrolling where there is none. */
+    if(SettingCount > SETTINGS_VISIBLE) {
+        int track_y = SETTINGS_ROW_Y - 9;
+        int track_h = SETTINGS_VISIBLE * SETTINGS_ROW_STEP - 2;
+        canvas_draw_frame(canvas, SETTINGS_BAR_X, track_y, 3, track_h);
+        int thumb_h = track_h * SETTINGS_VISIBLE / SettingCount;
+        if(thumb_h < 6) thumb_h = 6;
+        int thumb_y = track_y +
+                      (track_h - thumb_h) * app->top / (SettingCount - SETTINGS_VISIBLE);
+        canvas_draw_box(canvas, SETTINGS_BAR_X + 1, thumb_y + 1, 1, thumb_h - 2);
     }
 
     canvas_draw_str(canvas, 2, 63, "Back: close   Hold: exit");
@@ -663,57 +667,7 @@ static void draw_waiting(Canvas* canvas, App* app) {
         connected ? "BT: connected" : "BT: advertising");
 }
 
-/* Write the resolved layout to the app's data dir. The panel cannot be captured
- * from the host and the numbers depend on the font metric and the cover size, so
- * without this every layout question is guesswork — read it back with
- * `storage read /ext/apps_data/ytm_remote/layout.txt` over the CLI. */
-static void layout_dump(
-    App* app,
-    int art_bottom,
-    int text_top,
-    int bar_y,
-    int bar_h,
-    int font_h,
-    int title_sum,
-    int title_str) {
-    /* Short lines, so the diagnostics page can show them as-is. */
-    snprintf(
-        app->dump_text,
-        sizeof(app->dump_text),
-        "art %ux%u f%d y%d t%d\n"
-        "t_sum %d t_str %d\n"
-        "lim %d scr %u hold %d\n"
-        "bar %d..%d c%d\n",
-        app->art_w,
-        app->art_h,
-        font_h,
-        art_bottom,
-        text_top,
-        title_sum,
-        title_str,
-        title_sum - TEXT_COL_W,
-        (unsigned)app->scroll,
-        app->scroll_end_hold ? 1 : 0,
-        bar_y,
-        bar_y + bar_h - 1,
-        TEXT_COL_W);
-    app->dump_pending = true;
-}
-
-/* Called from the app loop: writes whatever the draw callback last prepared. */
-static void layout_dump_write(App* app) {
-    Storage* storage = furi_record_open(RECORD_STORAGE);
-    storage_common_mkdir(storage, CFG_DIR);
-    File* file = storage_file_alloc(storage);
-    if(storage_file_open(file, CFG_DIR "/layout.txt", FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
-        size_t n = strlen(app->dump_text);
-        storage_file_write(file, app->dump_text, n);
-    }
-    storage_file_close(file);
-    storage_file_free(file);
-    furi_record_close(RECORD_STORAGE);
-}
-
+/* The now-playing screen: cover, progress bar, times, and the marquee. */
 static void draw_now_playing(Canvas* canvas, App* app) {
     if(!app->have_meta && !app->have_art) {
         draw_waiting(canvas, app);
@@ -774,30 +728,6 @@ static void draw_now_playing(Canvas* canvas, App* app) {
     int h = text_top - text_gap - bar_y; /* the bar fills what is left */
     if(h > 0) draw_bar(canvas, 2, bar_y, 124, h, app->pos, app->dur);
 
-    /* Dump the resolved layout and marquee state so they can be checked from the
-     * host instead of guessed at: on any layout change, and on entering/leaving
-     * the end pause (which is the state that looks wrong from the sofa). */
-    static uint16_t dumped_art_h;
-    static int dumped_bar_y = -1;
-    static int dumped_max = -1;
-    static bool dumped_hold = false;
-    if(app->art_h != dumped_art_h || bar_y != dumped_bar_y ||
-       (int)app->scroll_max != dumped_max || app->scroll_end_hold != dumped_hold) {
-        dumped_art_h = app->art_h;
-        dumped_bar_y = bar_y;
-        dumped_max = (int)app->scroll_max;
-        dumped_hold = app->scroll_end_hold;
-        layout_dump(
-            app,
-            art_bottom,
-            text_top,
-            bar_y,
-            h,
-            (int)canvas_current_font_height(canvas),
-            text_w(canvas, title),
-            canvas_string_width(canvas, title));
-    }
-
     char elapsed[12], total[12];
     fmt_time(elapsed, sizeof(elapsed), app->pos);
     /* An unknown length is not 0:00 — say so rather than display a wrong time. */
@@ -828,28 +758,6 @@ static void draw_help(Canvas* canvas, App* app) {
     canvas_set_font(canvas, FontSecondary);
     for(size_t i = 0; i < sizeof(LINES) / sizeof(LINES[0]); i++) {
         canvas_draw_str(canvas, 3, 17 + (int)i * 9, LINES[i]);
-    }
-}
-
-/* Diagnostics: the numbers behind the layout and the marquee, readable off the
- * device when the host cannot see the screen. */
-static void draw_diag(Canvas* canvas, App* app) {
-    canvas_set_font(canvas, FontPrimary);
-    canvas_draw_str(canvas, 3, 8, "Diag");
-    canvas_set_font(canvas, FontSecondary);
-
-    const char* p = app->dump_text;
-    int y = 17;
-    while(*p && y <= 62) {
-        char line[28];
-        size_t i = 0;
-        while(*p && *p != '\n' && i < sizeof(line) - 1) {
-            line[i++] = *p++;
-        }
-        line[i] = 0;
-        if(*p == '\n') p++;
-        canvas_draw_str(canvas, 3, y, line);
-        y += 9;
     }
 }
 
@@ -928,8 +836,6 @@ static void draw_callback(Canvas* canvas, void* context) {
     canvas_clear(canvas);
     if(app->help_open) {
         draw_help(canvas, app);
-    } else if(app->diag_open) {
-        draw_diag(canvas, app);
     } else if(app->settings_open) {
         draw_settings(canvas, app);
     } else if(app->bt_status != BtStatusConnected) {
@@ -1300,12 +1206,6 @@ int32_t ytm_remote_app(void* p) {
         if(app->toast_clear_pending && (int32_t)(app->toast_until - furi_get_tick()) <= 0) {
             app->toast_clear_pending = false;
             view_port_update(app->vp);
-        }
-
-        /* File I/O lives here, on the loop's thread, not in the draw callback. */
-        if(app->dump_pending) {
-            app->dump_pending = false;
-            layout_dump_write(app);
         }
 
         /* The serial service keeps a receive-credit counter that it only refills
