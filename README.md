@@ -296,6 +296,10 @@ redrawing the screen.
   Settings -> Bluetooth. `--pair` also works on Linux.
 - **Windows: volume keys do nothing.** `pycaw` is not installed, or that app has
   no audio session yet (nothing has played since it started).
+- **Windows: a terminal window flashes while music plays.** That was the
+  `yt-dlp` length lookup: `pythonw.exe` has no console, so a console child gets a
+  new one, i.e. a window. The bridge now starts it with `CREATE_NO_WINDOW`; if a
+  terminal still flashes, the child holding it is whatever replaced `yt-dlp`.
 - **Windows: nothing happens after logging in.** `windows_startup.py status`
   prints the exact command and the end of `bridge.log`; a bridge that was started
   hidden is otherwise invisible. If the log is empty, the shortcut's `pythonw.exe`
