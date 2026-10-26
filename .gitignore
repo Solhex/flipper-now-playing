@@ -3,3 +3,5 @@ __pycache__/
 dist/
 .vscode/
 windows-support.patch
+.venv/
+.buildenv/

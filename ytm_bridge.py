@@ -198,6 +198,7 @@ class BrowserLink:
         self.polls = 0              # long-poll requests: proof the extension listens
         self._commands = queue.Queue()
         self._lock = threading.Lock()
+        self.wait_timeout = 20.0    # how long a poll may block before it answers empty
         self._server = None
         self._thread = None
         self.remote_base = ""
@@ -312,7 +313,7 @@ class BrowserLink:
                         link.polls += 1
                     started = time.monotonic()
                     try:
-                        command = link._commands.get(timeout=20)
+                        command = link._commands.get(timeout=link.wait_timeout)
                     except queue.Empty:
                         command = {"cmd": None}
                     if command.get("cmd"):

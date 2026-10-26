@@ -426,6 +426,37 @@ It prints the track, the art age, the length, what the Flipper is being fed and
 the drift, then a verdict: `MATCH` within 2s, otherwise which way it is off (and
 that only means anything while playing — the art file keeps ageing while paused).
 
+## Tests
+
+`tests/test_bridge.py` pins the parts that are awkward to exercise by hand: the
+wire format (parsed back byte by byte the way the device does), the XBM bit
+polarity and row padding, the elapsed-time clock, MPRIS metadata parsing (fed
+canned `playerctl` output, so the Linux side is covered on any machine), and the
+extension's localhost protocol.
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+Nothing there needs a Flipper, a browser or a media player.
+
+## Building the app on Windows
+
+`ufbt` needs the ARM toolchain (~1.3 GB) and the SDK; both live outside the repo:
+
+```bat
+py -3 -m venv .buildenv
+.buildenv\Scripts\pip install ufbt
+set UFBT_HOME=D:\ufbt          :: only if the system drive is short on space
+.buildenv\Scripts\python -m ufbt           :: -> dist\ytm_remote.fap
+.buildenv\Scripts\python -m ufbt launch    :: upload + run (needs the app closed)
+```
+
+`ufbt launch` uploads the FAP but cannot stop a running app — the firmware only
+allows that by hand — so the last step is Back on the device and reopening the
+app. Run `python -m py_compile` somewhere outside the project folder: a stray
+`__pycache__` in it is handed to the linker and fails the build.
+
 ## Testing without real music
 
 `~/.hermes/cache/scratch/mpris-fake/fake_mpris.py` (also shipped as
