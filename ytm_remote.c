@@ -776,8 +776,10 @@ static void draw_now_playing(Canvas* canvas, App* app) {
     if(app->liked != 2) {
         const uint8_t* icon = app->liked == 1 ? HEART_BITS : HEART_BROKEN;
         int hx = 64 - HEART_W / 2;
-        int hy = bar_y + (h > 0 ? h : 0);          /* first row under the bar */
-        if(hy + HEART_H > 63) hy = 63 - HEART_H;   /* never into the bottom edge */
+        /* Bottom-aligned with the time digits: the last row of the screen is the
+         * baseline the elapsed/total text sits on, so the heart ends level with
+         * it instead of floating just under the bar. */
+        int hy = 63 - HEART_H + 1;
         canvas_draw_xbm(canvas, hx, hy, HEART_W, HEART_H, icon);
     }
 
