@@ -30,7 +30,9 @@
       const now = button.getAttribute("aria-pressed") === "true" ? "false" : "true";
       button.setAttribute("aria-pressed", now);
       log.textContent = `clicked -> aria-pressed=${now}`;
-      document.title = now === "true" ? "Mock Track (liked)" : "Mock Track";
+      /* Deliberately does NOT change document.title: the real site's media-session
+       * title stays the same when you like a track, and the extension matches a
+       * toggle command against that title. */
     });
     log.textContent = `ready, aria-pressed=${button.getAttribute("aria-pressed")}`;
   </script>

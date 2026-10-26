@@ -51,8 +51,19 @@
   /* The bridge asks for this when the Flipper's like button is held: click the
    * real button, then report what the page settled on (the site answers
    * asynchronously, so the immediate read is often still the old value). */
+  const sameTrack = (wanted) => {
+    if (!wanted) return true;                 // no target: act, as before
+    const mine = (trackInfo().title || "").trim().toLowerCase().slice(0, 24);
+    const theirs = String(wanted).trim().toLowerCase().slice(0, 24);
+    return !mine || !theirs || mine === theirs;
+  };
+
   chrome.runtime.onMessage.addListener((message) => {
     if (!message || message.type !== "toggle") return;
+    /* Two browsers can both have YouTube Music open, and only one of them is the
+     * page the bridge is following. Without this guard the wrong tab gets the
+     * click — the like appears to do nothing while a different track changes. */
+    if (!sameTrack(message.title)) return;
     const b = button();
     if (!b) return;
     b.click();

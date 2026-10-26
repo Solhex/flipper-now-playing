@@ -12,6 +12,7 @@
     "96": "icons/icon-96.png",
     "128": "icons/icon-128.png"
   },
+  "permissions": ["alarms"],
   "host_permissions": [
     "https://music.youtube.com/*",
     "http://127.0.0.1:8765/*"

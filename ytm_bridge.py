@@ -32,6 +32,7 @@ import io
 import json
 import os
 import shutil
+import socket
 import queue
 import subprocess
 import sys
@@ -234,16 +235,17 @@ class BrowserLink:
                                                        time.monotonic() - self.updated < 6.0)}
 
     # ---- commands
-    def request_toggle(self):
+    def request_toggle(self, title=""):
         if self.remote_base:
             try:
-                request = urllib.request.Request(f"{self.remote_base}/toggle",
-                                                 data=b"{}", method="POST")
+                request = urllib.request.Request(
+                    f"{self.remote_base}/toggle",
+                    data=json.dumps({"title": title}).encode(), method="POST")
                 urllib.request.urlopen(request, timeout=5).read()
             except Exception as exc:
                 print("  toggle: could not reach the running bridge:", exc)
             return
-        self._commands.put({"cmd": "toggle"})
+        self._commands.put({"cmd": "toggle", "title": title})
 
     def _answers(self):
         try:
@@ -300,7 +302,12 @@ class BrowserLink:
                 if self.path.startswith("/toggle"):
                     # Test hook: the same command the Flipper's like button sends,
                     # so the round trip can be checked with curl and no hardware.
-                    link.request_toggle()
+                    title = ""
+                    try:
+                        title = (json.loads(body or b"{}") or {}).get("title", "")
+                    except ValueError:
+                        pass
+                    link.request_toggle(title)
                     self._reply(200, b'{"queued":"toggle"}')
                     return
                 try:
@@ -392,7 +399,7 @@ class BrowserLink:
         self._server = None
 
 
-def link_toggle(link, timeout=2.5, attempts=2):
+def link_toggle(link, title="", timeout=2.5, attempts=2):
     """Ask the extension to press like; returns the new state, or None.
 
     Waits for the *like state* to move, not for any report: the page heartbeats
@@ -408,7 +415,7 @@ def link_toggle(link, timeout=2.5, attempts=2):
         return None
     for _ in range(max(1, attempts)):
         before = link.changes
-        link.request_toggle()
+        link.request_toggle(title)
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             time.sleep(0.05)
@@ -494,6 +501,13 @@ class FirefoxDebug:
             import websocket
         except ImportError:
             self.error = "websocket-client is not installed"
+            return False
+        # Cheap check first: a closed port is the normal case when the extension
+        # is the one supplying the like state, and it should not read as an error.
+        try:
+            socket.create_connection(("127.0.0.1", self.port), timeout=0.3).close()
+        except OSError:
+            self.error = f"no debug port on {self.port}"
             return False
         try:
             self.ws = websocket.create_connection(
@@ -1073,35 +1087,55 @@ if IS_WINDOWS:
                 return
             cache = {"at": 0.0, "session": None}
 
-            def session_for(pid):
+            def session_for(pid, exe):
+                """This app's audio session.
+
+                The pid alone is not enough: Chromium browsers play audio from a
+                *different* process than the one owning the window (Brave's window
+                was 1384 while its audio session was 7988), so the window's pid
+                finds nothing and the volume keys silently do nothing. Match the
+                process name as well, preferring a session that is actually
+                playing.
+                """
                 now = time.monotonic()
                 cached = cache["session"]
                 if cached is not None and now - cache["at"] < 2.0:
                     try:
-                        if pid is None or cached.ProcessId == pid:
+                        same_pid = pid is not None and cached.ProcessId == pid
+                        same_proc = (exe and cached.Process
+                                     and cached.Process.name().lower() == exe.lower())
+                        if same_pid or same_proc:
                             return cached
                     except Exception:
                         cache["session"] = None
-                best = None
+
+                exact = None
+                family = None
+                playing = None
                 for session in AudioUtilities.GetAllSessions():
                     try:
                         if session.Process is None:
                             continue
-                        if pid is not None:
-                            if session.ProcessId == pid:
-                                best = session
-                                break
-                        elif getattr(session, "State", 0) == 1 and best is None:
-                            best = session        # first actively-playing app
+                        name = session.Process.name().lower()
+                        active = getattr(session, "State", 0) == 1
+                        if pid is not None and session.ProcessId == pid:
+                            exact = session
+                        elif exe and name == exe.lower():
+                            family = family or session
+                            if active and playing is None:
+                                playing = session
+                        elif pid is None and exe is None and active and playing is None:
+                            playing = session      # no hint: first active app
                     except Exception:
                         continue
+                best = exact or playing or family
                 cache["at"], cache["session"] = now, best
                 return best
 
             while True:
-                pid, sign, reply = self._queue.get()
+                pid, exe, sign, reply = self._queue.get()
                 try:
-                    session = session_for(pid)
+                    session = session_for(pid, exe)
                     if session is None:
                         reply.set_result(None)
                         continue
@@ -1116,21 +1150,21 @@ if IS_WINDOWS:
                 except Exception:
                     reply.set_result(None)
 
-        def _call(self, pid, sign=None, timeout=1.5):
+        def _call(self, pid, exe=None, sign=None, timeout=1.5):
             if not self.ready:
                 return None
             reply = concurrent.futures.Future()
-            self._queue.put((pid, sign, reply))
+            self._queue.put((pid, exe, sign, reply))
             try:
                 return reply.result(timeout=timeout)
             except Exception:
                 return None
 
-        def get(self, pid):
-            return self._call(pid)
+        def get(self, pid, exe=None):
+            return self._call(pid, exe)
 
-        def nudge(self, pid, sign):
-            return self._call(pid, sign)
+        def nudge(self, pid, sign, exe=None):
+            return self._call(pid, exe, sign)
 
     class WindowsBackend:
         """Windows media sessions (SMTC) + Firefox-friendly playback control.
@@ -1172,6 +1206,7 @@ if IS_WINDOWS:
             self._art_try = 0.0
             self._art_started = 0.0
             self._volume_cache = (0.0, None)
+            self._exe = None
             self._warned_missing = False
             self._sink = None
             self._sink_cache = (0.0, None)
@@ -1336,7 +1371,7 @@ if IS_WINDOWS:
                     if candidate and candidate != self._art:
                         self._art = candidate
 
-            self._pid = self._pid_for(session)
+            self._pid, self._exe = self._process_for(session)
             return {
                 "title": title,
                 "artist": artist,
@@ -1387,7 +1422,7 @@ if IS_WINDOWS:
             since, level = self._volume_cache
             if time.monotonic() - since < 0.5:
                 return level
-            level = self._volume.get(self._pid)
+            level = self._volume.get(self._pid, self._exe)
             self._volume_cache = (time.monotonic(), level)
             return level
 
@@ -1429,9 +1464,10 @@ if IS_WINDOWS:
             if self.link is not None:
                 self.link.close()
 
-        def _pid_for(self, session):
+        def _process_for(self, session):
+            """(pid, exe) of the app behind the session, for the volume controls."""
             row = self.window_for(getattr(session, "source_app_user_model_id", "") or "")
-            return row.pid if row else None
+            return (row.pid, row.process) if row else (None, None)
 
         # ---- commands
         def _refresh_sink(self):
@@ -1522,20 +1558,26 @@ if IS_WINDOWS:
 
         # ---- volume / like
         def volume(self, sign):
-            level = self._volume.nudge(self._pid, sign)
+            level = self._volume.nudge(self._pid, sign, self._exe)
             if level is None:
                 print("  !! volume: no audio session for this player")
             return level
 
         def _yt_window(self):
-            """The Firefox window that has YouTube Music as its active tab.
+            """The browser window that has YouTube Music as its active tab.
 
             Typing at a window only reaches the *active* tab, so the window is
-            identified by its title: YouTube Music puts the site name there,
-            and while a track plays the tab title carries the track too.
+            identified by its title: YouTube Music puts the site name there, and
+            while a track plays the tab title carries the track too.
+
+            The player's own browser is tried first (Brave, Chrome, Firefox...),
+            because a keystroke aimed at the wrong application types into it.
             """
-            rows = [row for row in self.windows() if "firefox" in row.process.lower()]
-            for row in rows:
+            rows = self.windows()
+            exe = (self._exe or "").lower()
+            preferred = [row for row in rows if exe and row.process.lower() == exe]
+            rest = [row for row in rows if row not in preferred]
+            for row in preferred + rest:
                 if "youtube music" in row.title.lower():
                     return row
             return None
@@ -1570,10 +1612,15 @@ if IS_WINDOWS:
             works while the bridge is in the background — the keystroke path can
             only type at a focused window.
             """
-            state = link_toggle(self.link)
+            state = link_toggle(self.link, self._title)
             if state is not None:
                 self._liked, self._liked_at = state, 0.0
                 return True, ("Liked" if state else "Unliked"), state
+            if self.link is not None and self.link.fresh():
+                # An extension is reporting, so typing at a window is pointless
+                # (and on Chromium it cannot work at all): say what happened
+                # instead of pointing at a tab that is already open.
+                return False, "Browser did not click", None
 
             if self._debug is not None:
                 state = self._debug.toggle(self._title)
