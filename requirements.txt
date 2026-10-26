@@ -2,6 +2,9 @@
 bleak>=1.0
 pillow>=10
 
+# Reading YouTube Music's like button through Firefox's remote debugging port.
+websocket-client>=1.6
+
 # Optional: track lengths for players that report none (Firefox/YouTube Music).
 # Without it the elapsed time still ticks, but the total and the progress bar
 # stay empty.

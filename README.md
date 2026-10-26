@@ -61,7 +61,11 @@ py -3 -m venv .venv
 .venv\Scripts\python ytm_bridge.py --dump     :: the exact numbers that would go to the Flipper
 .venv\Scripts\python ytm_bridge.py --pair     :: pair the Flipper once (Windows needs a bond)
 .venv\Scripts\python ytm_bridge.py --name Gumi --player firefox
+.venv\Scripts\python ytm_bridge.py --dump --firefox-port 0   :: skip the like state
 ```
+
+`--firefox-port` (default 9222, `0` turns it off) is where the like state comes
+from — see [Liked state](#liked-state-the-heart).
 
 `--dump` and `--cmd` (one button, e.g. `--cmd p`) need no Flipper, which is the
 quickest way to tell a bridge problem from a device problem. On the Flipper:
@@ -206,11 +210,41 @@ and then repeats every 150 ms, so after a hold the app ignores Up/Down for 1.5 s
 (`SONG_COOLDOWN_MS`) — otherwise the trailing repeats would nudge the volume
 right after the track changed.
 
+## Liked state (the heart)
+
+The track screen draws a small heart after the elapsed time when the current
+track is liked. Nothing in MPRIS or the Windows media session exposes that — only
+the page knows — so the bridge asks the page, through Firefox's remote agent:
+
+```bat
+.venv\Scripts\python windows_startup.py firefox   :: Desktop shortcut with the debug port
+```
+
+Firefox must be **started** with `--remote-debugging-port=9222` (the port belongs
+to whichever instance of a profile starts first, so quit Firefox fully before
+using that shortcut). The bridge then reads the like button's `aria-pressed` once
+a second and presses the same button when you hold OK, which is why the heart
+follows your own clicks in the browser too.
+
+Things worth knowing:
+
+- **No port, no heart.** Without the debug port the bridge says
+  `like state: unavailable (...)` and sends "unknown", which draws nothing —
+  better a blank than a wrong heart.
+- Firefox allows **one** debug session at a time. The running bridge holds it, so
+  `--dump`/`--cmd` cannot open a second one; they say so and fall back to the
+  keystroke path for like. A client that dies without ending its session leaves
+  the port unusable until Firefox restarts (the bridge keeps retrying).
+- Firefox speaks **WebDriver BiDi**, not Chrome's CDP: `/json/list` answers 404
+  and the websocket *is* the `/session` handshake endpoint. `websocket-client` is
+  the only extra dependency.
+
 ## Like (hold OK)
 
-Neither MPRIS nor the Windows media session has a like action, so this types
-YouTube Music's own shortcut (`shift+=`) at the browser. That has consequences
-worth knowing:
+Neither MPRIS nor the Windows media session has a like action, so this presses
+YouTube Music's own like button in the page — or, when the debug port is not
+open, types its shortcut (`shift+=`) at the browser. That has consequences worth
+knowing:
 
 - **The YouTube Music tab has to be the one on screen.** A window's title is its
   active tab's title, so the bridge looks for a window named "… - YouTube Music",
@@ -266,6 +300,7 @@ advertise notify — yields a link where metadata flows but buttons appear dead.
                which is what keeps the per-tick frame inside one BLE write.
       0x02 ART : [w:1][h:1][1-bit rows, (w+7)/8 per row, LSB-first per byte]
       0x03 VOL : [volume:1]  percent, 0..100 — shows the volume overlay
+      0x05 LIKE: [state:1]   0 = not liked, 1 = liked, 2 = unknown — draws a heart
 
 Flipper -> PC: a single command byte (`p` `n` `b` `-` `+` `u` `d`; `u`/`d` are
 the volume keys). Unknown frame types and oversized payloads are dropped and the

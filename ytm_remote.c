@@ -89,6 +89,7 @@ static size_t bounded_len(const char* s, size_t max) {
 
 #define FRAME_META  0x01
 #define FRAME_ART   0x02
+#define FRAME_LIKE  0x05
 #define FRAME_VOL   0x03
 #define FRAME_TOAST 0x04 /* a short line of text from the PC, shown briefly */
 
@@ -206,6 +207,8 @@ struct App {
     bool tmp_hold; /* backlight held on only because the menu is open */
 
     uint32_t song_cooldown; /* tick until which Up/Down is ignored */
+
+    uint8_t liked; /* 0 = not liked, 1 = liked, 2 = unknown (nothing drawn) */
 
     uint8_t volume; /* last volume reported by the PC, 0..100 */
     bool have_vol; /* PC has reported a volume at least once */
@@ -676,6 +679,19 @@ static void draw_waiting(Canvas* canvas, App* app) {
         connected ? "BT: connected" : "BT: advertising");
 }
 
+/* A filled heart, 8x6, XBM order (LSB first, symmetric so either way reads the
+ * same). Drawn after the elapsed time when the PC reports the track is liked. */
+#define HEART_W 8
+#define HEART_H 6
+static const uint8_t HEART_BITS[] = {
+    0x66, /* .##..##. */
+    0xFF, /* ######## */
+    0xFF, /* ######## */
+    0x7E, /* .######. */
+    0x3C, /* ..####.. */
+    0x18, /* ...##... */
+};
+
 /* The now-playing screen: cover, progress bar, times, and the marquee. */
 static void draw_now_playing(Canvas* canvas, App* app) {
     if(!app->have_meta && !app->have_art) {
@@ -747,6 +763,13 @@ static void draw_now_playing(Canvas* canvas, App* app) {
     }
     canvas_draw_str(canvas, 2, 63, elapsed);
     canvas_draw_str_aligned(canvas, 126, 63, AlignRight, AlignBottom, total);
+
+    /* A small heart after the elapsed time when the track is liked. Only the
+     * "liked" state draws anything: unknown and not-liked both leave the row as
+     * it was, so the screen never claims something the PC cannot see. */
+    if(app->liked == 1) {
+        canvas_draw_xbm(canvas, 36, 57, HEART_W, HEART_H, HEART_BITS);
+    }
 }
 
 /* The key-bind reference, opened from the settings menu. Terse on purpose: the
@@ -950,6 +973,21 @@ static bool handle_art(App* app, const uint8_t* b, uint16_t len) {
     return changed;
 }
 
+/* Whether the current track is liked, so the screen can show a heart. The PC
+ * knows it only when it can read YouTube Music's own button (Firefox's remote
+ * debugging port); otherwise it sends 2 and nothing is drawn — better a blank
+ * than a wrong heart. */
+static bool handle_like(App* app, const uint8_t* b, uint16_t len) {
+    if(len < 1) return false;
+
+    uint8_t state = b[0] > 2 ? 2 : b[0];
+    furi_mutex_acquire(app->mutex, FuriWaitForever);
+    bool changed = app->liked != state;
+    app->liked = state;
+    furi_mutex_release(app->mutex);
+    return changed;
+}
+
 /* A short message from the PC — how the like went, say. Shown for a moment;
  * the loop clears it, like the volume overlay. */
 static bool handle_toast(App* app, const uint8_t* b, uint16_t len) {
@@ -984,6 +1022,7 @@ static const FrameSpec FRAME_SPECS[] = {
     {FRAME_ART, ART_PAYLOAD, handle_art},
     {FRAME_VOL, 1, handle_vol},
     {FRAME_TOAST, TOAST_MAX, handle_toast},
+    {FRAME_LIKE, 1, handle_like},
 };
 
 static const FrameSpec* frame_spec(uint8_t type) {
@@ -1095,6 +1134,7 @@ int32_t ytm_remote_app(void* p) {
     UNUSED(p);
     App* app = malloc(sizeof(App));
     memset(app, 0, sizeof(App));
+    app->liked = 2; /* unknown until the PC says otherwise */
     app->mutex = furi_mutex_alloc(FuriMutexTypeNormal);
     app->running = true;
     app->idle_since = furi_get_tick();

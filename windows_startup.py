@@ -29,6 +29,8 @@ import sys
 from pathlib import Path
 
 SHORTCUT_NAME = "YT Music Remote Bridge.lnk"
+FIREFOX_SHORTCUT = "Firefox (remote debugging).lnk"
+FIREFOX_PORT = 9222
 # PowerShell is a console app: launched from pythonw.exe it would open a console
 # window of its own. The installer usually runs from a terminal, but keeping it
 # silent costs nothing and avoids a flash when it is re-run from a scheduled task.
@@ -51,6 +53,54 @@ def shortcut_path():
 def pythonw():
     candidate = Path(sys.executable).with_name("pythonw.exe")
     return candidate if candidate.exists() else Path(sys.executable)
+
+
+def desktop_dir():
+    """The real Desktop: OneDrive redirects it on many machines."""
+    home = Path(os.environ.get("USERPROFILE") or Path.home())
+    onedrive = Path(os.environ["OneDrive"]) / "Desktop" if os.environ.get("OneDrive") else None
+    for candidate in (onedrive, home / "Desktop"):
+        if candidate and candidate.is_dir():
+            return candidate
+    return home / "Desktop"
+
+
+def firefox_exe():
+    candidates = [Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Mozilla Firefox" / "firefox.exe",
+                  Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Mozilla Firefox" / "firefox.exe"]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    sys.exit("firefox.exe not found in the usual Program Files locations")
+
+
+def firefox_shortcut(port=FIREFOX_PORT):
+    """A Firefox shortcut that carries --remote-debugging-port.
+
+    Only the *first* instance of a profile owns the port, so this shortcut has to
+    be how Firefox is started; running it while Firefox is already open just
+    opens a tab in the flag-less instance.
+    """
+    target = desktop_dir() / FIREFOX_SHORTCUT
+    script = f"""
+$ws = New-Object -ComObject WScript.Shell
+$lnk = $ws.CreateShortcut({_ps_quote(target)})
+$lnk.TargetPath = {_ps_quote(firefox_exe())}
+$lnk.Arguments = {_ps_quote(f"--remote-debugging-port={port}")}
+$lnk.WorkingDirectory = {_ps_quote(firefox_exe().parent)}
+$lnk.IconLocation = {_ps_quote(str(firefox_exe()) + ",0")}
+$lnk.Description = 'Firefox with the debug port the Flipper bridge reads the like state from'
+$lnk.Save()
+"""
+    result = subprocess.run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+        capture_output=True, text=True, creationflags=CREATE_NO_WINDOW)
+    if result.returncode != 0:
+        sys.exit(f"could not create the Firefox shortcut: {result.stderr.strip()}")
+    print(f"Created: {target}")
+    print(f"  runs: {firefox_exe()} --remote-debugging-port={port}")
+    print("\nQuit Firefox completely, then start it from that shortcut — the debug port")
+    print("belongs to whichever instance starts first.")
 
 
 def log_path():
@@ -149,7 +199,7 @@ def status():
 
 def main():
     ap = argparse.ArgumentParser(description="Start the Flipper bridge at Windows logon")
-    ap.add_argument("action", choices=("install", "uninstall", "status"))
+    ap.add_argument("action", choices=("install", "uninstall", "status", "firefox"))
     ap.add_argument("--name", default=os.environ.get("FLIPPER_NAME", "Flipper"),
                     help="BLE name substring of your Flipper")
     ap.add_argument("--args", default="", help="extra bridge arguments, e.g. "
@@ -163,7 +213,8 @@ def main():
 
     {"install": lambda: install(args.name, args.args),
      "uninstall": uninstall,
-     "status": status}[args.action]()
+     "status": status,
+     "firefox": firefox_shortcut}[args.action]()
 
 
 if __name__ == "__main__":

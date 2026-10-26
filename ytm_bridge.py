@@ -24,6 +24,7 @@ Flipper -> PC: one command byte each (CMD_TRANSPORT / CMD_VOLUME below)
 """
 
 import argparse
+import atexit
 import asyncio
 import concurrent.futures
 import io
@@ -66,8 +67,11 @@ REFRESH_S = 0.4        # Windows: how often the media-session manager is re-requ
 ART_SETTLE_S = 4.0     # Windows: how long a new track's cover is still being published
 ART_RETRY_S = 0.4      # Windows: cover re-read interval while a track settles
 ART_RECHECK_S = 5.0    # Windows: cover re-read interval once settled, if still missing
+LIKE_REFRESH_S = 1.0   # how often the like button is re-read (one localhost round trip)
+LIKE_PORT = 9222       # Firefox --remote-debugging-port default
 
-FRAME_META, FRAME_ART, FRAME_VOL, FRAME_TOAST = 0x01, 0x02, 0x03, 0x04
+FRAME_META, FRAME_ART, FRAME_VOL, FRAME_TOAST, FRAME_LIKE = 0x01, 0x02, 0x03, 0x04, 0x05
+LIKE_NO, LIKE_YES, LIKE_UNKNOWN = 0, 1, 2
 TOAST_MAX = 24         # the device shows one short line
 
 # ---------------------------------------------------------------- state files
@@ -159,6 +163,203 @@ def pct(fraction):
         return None
 
 
+# =================================================== like state (Firefox BiDi)
+class FirefoxDebug:
+    """Reads and toggles YouTube Music's like button through Firefox's remote agent.
+
+    Neither MPRIS nor the Windows media session exposes "is this track liked", so
+    the state has to come from the page. Firefox started with
+    `--remote-debugging-port=<port>` serves a WebDriver BiDi agent, and BiDi can
+    run script in a tab: `script.evaluate` reads the like button's aria-pressed,
+    and clicking that button is what the site itself does.
+
+    Firefox does *not* speak Chrome's CDP any more (158 answers /json/list with
+    404) and the socket is the handshake endpoint itself: GET /session upgrades,
+    then session.new / browsingContext.getTree / script.evaluate travel over it.
+    Only one BiDi session may exist per browser, so the connection is kept open
+    rather than opened per poll.
+    """
+
+    LIKE = "ytmusic-like-button-renderer #button-shape-like button"
+    STATE_EXPR = ("(() => { const b = document.querySelector('" + LIKE + "');"
+                  " return b ? b.getAttribute('aria-pressed') : null; })()")
+    CLICK_EXPR = "document.querySelector('" + LIKE + "')?.click(), true"
+    TITLE_EXPR = "document.title"
+
+    def __init__(self, port):
+        self.port = int(port)
+        # One socket, two callers: the poll loop's background refresh and a
+        # button press. Firefox allows a single BiDi session, so they serialise.
+        self._lock = threading.RLock()
+        self.ws = None
+        self.counter = 0
+        self.context = None
+        self.context_at = 0.0
+        self.error = ""
+        self.reported = ""
+
+    # ---- protocol plumbing
+    def _call(self, method, params=None, timeout=8.0):
+        socket = self.ws
+        if socket is None:
+            raise RuntimeError("not connected")
+        self.counter += 1
+        message_id = self.counter
+        socket.send(json.dumps({"id": message_id, "method": method, "params": params or {}}))
+        deadline = time.monotonic() + timeout
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise TimeoutError(method)
+            socket.settimeout(left)
+            message = json.loads(socket.recv())
+            if message.get("id") != message_id:
+                continue                    # an event, not our reply
+            if message.get("type") == "error":
+                raise RuntimeError(f"{message.get('error')}: {message.get('message')}")
+            return message.get("result", {})
+
+    def _evaluate(self, context, expression):
+        result = self._call("script.evaluate", {
+            "expression": expression,
+            "target": {"context": context},
+            "awaitPromise": True,
+            "resultOwnership": "none",
+        })
+        remote = result.get("result", {})
+        return remote.get("value")
+
+    def connect(self):
+        with self._lock:
+            return self._connect()
+
+    def _connect(self):
+        if self.ws is not None:
+            return True
+        try:
+            import websocket
+        except ImportError:
+            self.error = "websocket-client is not installed"
+            return False
+        try:
+            self.ws = websocket.create_connection(
+                f"ws://127.0.0.1:{self.port}/session", timeout=5,
+                suppress_origin=True, header=["Sec-WebSocket-Protocol: WebDriver-BiDi"])
+            self._call("session.new", {"capabilities": {}})
+            self.context = None
+            self.error = ""
+            return True
+            atexit.register(self.end)
+        except Exception as exc:              # port closed, another session, ...
+            self.error = str(exc) or exc.__class__.__name__
+            if "active sessions" in self.error:
+                # Firefox allows one BiDi session at a time. Either the bridge is
+                # already holding it (normal) or a crashed client left it stuck.
+                self.error = ("another client holds Firefox's debug session "
+                              "(stop the bridge, or restart Firefox)")
+            self.close()
+            return False
+
+    def end(self):
+        """End the BiDi session before dropping the socket.
+
+        Firefox allows one BiDi session per browser and does not reliably notice
+        a client that just vanished, so a stale session would otherwise block the
+        next run with "Maximum number of active sessions".
+        """
+        with self._lock:
+            if self.ws is not None:
+                try:
+                    self._call("session.end", timeout=3)
+                except Exception:
+                    pass
+            self.close()
+
+    def close(self):
+        if self.ws is not None:
+            try:
+                self.ws.close()
+            except Exception:
+                pass
+        self.ws = None
+        self.context = None
+
+    def _note(self, message):
+        """Say why the like state is unavailable once, not on every poll."""
+        if message != self.reported:
+            self.reported = message
+            print("  like state:", message)
+
+    # ---- the page
+    def _context_for(self, title):
+        """The browsing context showing YouTube Music (rechecked every few seconds)."""
+        if self.context and time.monotonic() - self.context_at < 5.0:
+            return self.context
+        tree = self._call("browsingContext.getTree")
+        pages = [c for c in tree.get("contexts", [])
+                 if "music.youtube.com" in (c.get("url") or "")]
+        if not pages:
+            self.context = None
+            return None
+        # several YT Music tabs are possible: prefer the one playing this track
+        for page in pages:
+            try:
+                if title and title.strip().lower()[:24] in (self._evaluate(page["context"], self.TITLE_EXPR) or "").lower():
+                    self.context, self.context_at = page["context"], time.monotonic()
+                    return self.context
+            except Exception:
+                continue
+        self.context, self.context_at = pages[0]["context"], time.monotonic()
+        return self.context
+
+    def like_state(self, title=""):
+        """True / False / None (unknown) for the current track."""
+        with self._lock:
+            return self._like_state(title)
+
+    def _like_state(self, title=""):
+        if not self.connect():
+            self._note(f"unavailable ({self.error})")
+            return None
+        try:
+            context = self._context_for(title)
+            if context is None:
+                self._note("no YouTube Music tab found")
+                return None
+            pressed = self._evaluate(context, self.STATE_EXPR)
+            if pressed is None:
+                self._note("like button not found in the tab")
+                return None
+            self.reported = ""
+            return str(pressed).lower() == "true"
+        except Exception as exc:
+            self.error = str(exc) or exc.__class__.__name__
+            self.close()
+            self._note(f"unavailable ({self.error})")
+            return None
+
+    def toggle(self, title=""):
+        """Click the like button; returns the state afterwards, or None."""
+        with self._lock:
+            return self._toggle(title)
+
+    def _toggle(self, title=""):
+        if not self.connect():
+            return None
+        try:
+            context = self._context_for(title)
+            if context is None:
+                return None
+            self._evaluate(context, self.CLICK_EXPR)
+            time.sleep(0.6)                 # let the site update the button
+            self.context_at = 0.0           # force a fresh context lookup
+            return self._like_state(title)
+        except Exception as exc:
+            self.error = str(exc) or exc.__class__.__name__
+            self.close()
+            return None
+
+
 # ================================================================ Linux: MPRIS
 class MprisBackend:
     """Linux/BSD media sessions through playerctl (MPRIS over D-Bus)."""
@@ -187,6 +388,9 @@ class MprisBackend:
         except FileNotFoundError:
             sys.exit("playerctl not found — install it to read the media session")
         return [p for p in out.stdout.splitlines() if p.strip()]
+
+    def close(self):
+        pass
 
     async def read(self):
         """Return dict(title, artist, art, playing, pos, dur, url, vol) or None.
@@ -235,6 +439,7 @@ class MprisBackend:
             "url": (f["xesam:url"] or "").strip(),
             "vol": pct(f["volume"]),
             "app": self.player or "",
+            "liked": None,      # MPRIS has no like state; the Windows backend reads it
         }
 
     async def command(self, ch):
@@ -682,7 +887,7 @@ if IS_WINDOWS:
         name = "smtc"
         seek_step = SEEK_STEP_WIN
 
-        def __init__(self, hint=None):
+        def __init__(self, hint=None, firefox_port=None):
             from winrt.windows.media.control import (
                 GlobalSystemMediaTransportControlsSessionManager as Manager,
                 GlobalSystemMediaTransportControlsSessionPlaybackStatus as Status,
@@ -707,6 +912,11 @@ if IS_WINDOWS:
             self._warned_missing = False
             self._sink = None
             self._sink_cache = (0.0, None)
+            self._title = ""
+            self._debug = FirefoxDebug(firefox_port) if firefox_port else None
+            self._liked = None
+            self._liked_at = 0.0
+            self._liked_task = None
 
         # ---- sessions
         async def _ensure_manager(self, force=False):
@@ -874,7 +1084,35 @@ if IS_WINDOWS:
                 "url": "",
                 "vol": self._volume_level(),
                 "app": self.label(session),
+                "liked": await self._liked_state(title),
             }
+
+        async def _liked_state(self, title):
+            """True / False / None, refreshed in a worker thread.
+
+            The BiDi round trip blocks on a socket, so it runs off the event loop
+            and read() simply returns the last answer; at 20 Hz a blocking call
+            here would stall the metadata stream.
+            """
+            self._title = title
+            if self._debug is None:
+                return None
+            now = time.monotonic()
+            if self._liked_task is None and now - self._liked_at >= LIKE_REFRESH_S:
+                self._liked_at = now
+                loop = asyncio.get_running_loop()
+                task = asyncio.ensure_future(
+                    loop.run_in_executor(None, self._debug.like_state, title))
+                self._liked_task = task
+                task.add_done_callback(self._liked_done)
+            return self._liked
+
+        def _liked_done(self, task):
+            self._liked_task = None
+            try:
+                self._liked = task.result()
+            except Exception:
+                self._liked = None
 
         def _volume_level(self):
             """Current app volume, sampled twice a second.
@@ -919,6 +1157,11 @@ if IS_WINDOWS:
             if not guard["trusted"]:
                 return 0, 0
             return int(raw), dur
+
+        def close(self):
+            """Release the debug session; the BLE link is closed by the caller."""
+            if self._debug is not None:
+                self._debug.end()
 
         def _pid_for(self, session):
             row = self.window_for(getattr(session, "source_app_user_model_id", "") or "")
@@ -1055,6 +1298,17 @@ if IS_WINDOWS:
             return True
 
         def like(self):
+            """Toggle like: the button itself when the debug port is open, else keys.
+
+            Clicking through BiDi does not need the tab to be on screen, so it
+            works while the bridge is in the background — the keystroke path can
+            only type at a focused window.
+            """
+            if self._debug is not None:
+                state = self._debug.toggle(self._title)
+                if state is not None:
+                    self._liked, self._liked_at = state, 0.0
+                    return True, ("Liked" if state else "Unlike toggled")
             row = self._yt_window()
             if row is None:
                 return False, "Open the YT Music tab"
@@ -1116,6 +1370,11 @@ def toast_frame(text):
 def art_frame(art):
     w, h, data = art_to_xbm(art)
     return frame(FRAME_ART, bytes([w, h]) + data)
+
+
+def like_frame(state):
+    """0 = not liked, 1 = liked, 2 = unknown (the device draws nothing)."""
+    return frame(FRAME_LIKE, bytes([max(LIKE_NO, min(LIKE_UNKNOWN, int(state)))]))
 
 
 def vol_frame(level):
@@ -1365,6 +1624,7 @@ class Bridge:
         self.chunk = WRITE_CHUNK
         self.last_art = None
         self.last_vol = None
+        self.last_liked = None
         self.last_text = None
         self.device_caps = False
         self.last_sent = 0.0
@@ -1563,6 +1823,14 @@ class Bridge:
             except Exception as e:
                 print("  art failed:", e)
 
+        liked = LIKE_UNKNOWN if m.get("liked") is None else (
+            LIKE_YES if m["liked"] else LIKE_NO)
+        if liked != self.last_liked:
+            await self.write(like_frame(liked))
+            self.last_liked = liked
+            if liked != LIKE_UNKNOWN:
+                print(f"  -> like {'yes' if liked == LIKE_YES else 'no'}")
+
         if m["vol"] is not None and m["vol"] != self.last_vol:
             await self.send_volume(m["vol"])
             print(f"  -> volume {m['vol']}%")
@@ -1628,6 +1896,7 @@ class Bridge:
                     await asyncio.sleep(0.5)
                     self.last_art = None
                     self.last_vol = None
+                    self.last_liked = None
                     self.last_text = None
                     self.device_caps = False  # whatever connects must announce again
                     while client.is_connected:
@@ -1682,6 +1951,8 @@ async def dump_once(bridge, wait=12.0):
     print(f"length   : {meta['dur']}s" + ("" if meta["dur"] else "  (unknown)"))
     print(f"volume   : {'?' if meta['vol'] is None else str(meta['vol']) + '%'}")
     print(f"art      : {'none' if not meta['art'] else 'yes'}")
+    liked = meta.get("liked")
+    print(f"liked    : {'?' if liked is None else ('yes' if liked else 'no')}")
 
     if meta["art"]:
         try:
@@ -1695,9 +1966,11 @@ async def dump_once(bridge, wait=12.0):
 
 
 async def main_async(args):
+    firefox_port = getattr(args, "firefox_port", LIKE_PORT) or None
+
     if args.list:
         if IS_WINDOWS:
-            backend = WindowsBackend(args.player)
+            backend = WindowsBackend(args.player, firefox_port)
             rows = await backend.list()
             if not rows:
                 print("No media sessions — start playback in Firefox/YouTube Music first.")
@@ -1718,7 +1991,7 @@ async def main_async(args):
         return 0
 
     if IS_WINDOWS:
-        backend = WindowsBackend(args.player)
+        backend = WindowsBackend(args.player, firefox_port)
     else:
         player = args.player
         if not player:
@@ -1750,10 +2023,14 @@ async def main_async(args):
             print("like:", message, "" if ok else "(nothing typed)")
         else:
             await backend.command(args.cmd)
+        backend.close()
         return 0
 
     if args.dump:
-        return await dump_once(Bridge(backend, args.name, args.hz, args.address))
+        try:
+            return await dump_once(Bridge(backend, args.name, args.hz, args.address))
+        finally:
+            backend.close()
 
     bridge = Bridge(backend, args.name, args.hz, args.address)
     print(f"Polling at {bridge.hz:g} Hz")
@@ -1806,6 +2083,9 @@ def main():
     ap.add_argument("--pair", action="store_true",
                     help="pair with the Flipper and exit (Windows: pair once before first use)")
     ap.add_argument("--address", help="connect to this BLE address instead of scanning")
+    ap.add_argument("--firefox-port", type=int, default=LIKE_PORT, metavar="PORT",
+                    help="Firefox --remote-debugging-port used to read (and toggle) the "
+                         f"YouTube Music like button (default {LIKE_PORT}, 0 = off)")
     ap.add_argument("--log", metavar="PATH",
                     help="append all output to this file instead of the console "
                          "(for starting hidden at login)")
