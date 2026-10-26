@@ -327,9 +327,27 @@ Things worth knowing:
 ## Like (hold OK)
 
 Neither MPRIS nor the Windows media session has a like action, so this presses
-YouTube Music's own like button in the page — or, when the debug port is not
-open, types its shortcut (`shift+=`) at the browser. That has consequences worth
+YouTube Music's own like button in the page — the extension clicks it, and on
+Chromium a trusted keystroke finishes the job (see below). Consequences worth
 knowing:
+
+- **Chromium throws away untrusted events.** On Brave/Chrome/Edge a synthetic
+  `button.click()` lands exactly on the right element (proven: the message
+  arrives, the button is found, nothing covers it, it is not disabled) and
+  `aria-pressed` does not move, because the page ignores events that did not come
+  from the user. Firefox accepts the same click. So when the page reports a click
+  that changed nothing, it leaves the like button **focused**, and the bridge
+  presses a real **Enter** at the browser window — trusted input, which a focused
+  button treats as a click. Measured round trip on Brave: **1.4 s**.
+- **If the tab is behind another tab**, a keystroke would land in whatever tab is
+  in front. The extension then brings the YouTube Music tab forward, holds it for
+  the Enter, and puts the previous tab back afterwards. It only does this after
+  the page has confirmed the tab is not focused, and it never types blind.
+- **Two tabs or two browsers can both report.** Each tab sends a client id,
+  `focused`/`visible` and a `lastActive` stamp that moves on any click, key or
+  scroll, and the bridge follows the tab you last used: focused first, then most
+  recent activity. A like is addressed to that client and every other tab ignores
+  it.
 
 - **The YouTube Music tab has to be the one on screen.** A window's title is its
   active tab's title, so the bridge looks for a window named "… - YouTube Music",
@@ -420,7 +438,22 @@ redrawing the screen.
   expects a bonded device: run `ytm_bridge.py --pair` once, or pair it in
   Settings -> Bluetooth. `--pair` also works on Linux.
 - **Windows: volume keys do nothing.** `pycaw` is not installed, or that app has
-  no audio session yet (nothing has played since it started).
+  no audio session yet (nothing has played since it started). Chromium browsers
+  play audio from a *different process* than the one owning the window (Brave's
+  window was pid 1384 while its audio session was 7988), so the bridge matches
+  the process name as well as the pid and prefers a session that is playing.
+- **Extension reloaded and nothing works.** Reloading an unpacked extension
+  strips its content script from every open tab, and nothing puts it back. The
+  worker now re-injects `content.js` into any YouTube Music tab that has no
+  listener (at startup and when a toggle finds nobody home), and `content.js`
+  refuses to run twice so a double injection cannot click twice. If a like still
+  says `Reload the YT Music tab`, the worker is polling but no tab ever reported:
+  reload the tab once, then check that the page is really `music.youtube.com`.
+- **A like says `Browser did not click`.** The page was reached and its own click
+  did nothing. The report carries the reason in `diag.click` (`button`,
+  `renderers`, `covered`, `disabled`, `tag`, `ok`, `buttonFocused`,
+  `windowFocused`) — read it with `curl -s 127.0.0.1:8765/state`, it distinguishes
+  "no content script", "no like button" and "the click was refused".
 - **Windows: a terminal window flashes while music plays.** That was the
   `yt-dlp` length lookup: `pythonw.exe` has no console, so a console child gets a
   new one, i.e. a window. The bridge now starts it with `CREATE_NO_WINDOW`; if a

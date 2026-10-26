@@ -1739,10 +1739,19 @@ if IS_WINDOWS:
             works while the bridge is in the background — the keystroke path can
             only type at a focused window.
             """
-            state = link_toggle(self.link, self._title)
+            state = link_toggle(self.link, self._title, attempts=1)
             if state is not None:
                 self._liked, self._liked_at = state, 0.0
                 return True, ("Liked" if state else "Unliked"), state
+            first = (self.link.diag() or {}) if self.link is not None else {}
+            if not (first.get("click") or {}).get("buttonFocused"):
+                # No verdict from the page yet (a fresh worker has not attached its
+                # content script), so one retry is worth 2.5 s — but not once the
+                # page has already told us its own click does nothing.
+                state = link_toggle(self.link, self._title, attempts=1)
+                if state is not None:
+                    self._liked, self._liked_at = state, 0.0
+                    return True, ("Liked" if state else "Unliked"), state
             # Chromium drops untrusted events, so the page's own click can land
             # and do nothing. It leaves the like button focused for exactly this
             # case: a real Enter keypress at the browser window is trusted input,
