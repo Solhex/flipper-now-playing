@@ -271,10 +271,30 @@ class BrowserLink:
                 self.changes += 1
             return changed
 
+    def diag(self):
+        """What the page last said about its like button (None if it never did)."""
+        with self._lock:
+            record = self.clients.get(self.active_id or "", {})
+            return record.get("diag")
+
     def fresh(self, max_age=6.0):
         """True while at least one tab is reporting (heartbeat every 2 s)."""
         with self._lock:
             return self._select() is not None
+
+    def request_activate(self, client=None):
+        """Ask the extension to bring the reporting tab to the front for a keystroke."""
+        target = client or self.active_id
+        with self._lock:
+            worker = self.clients.get(target or "", {}).get("worker", "")
+        self._commands.put({"cmd": "activate", "client": target, "worker": worker})
+
+    def request_restore(self, client=None):
+        """Put the tab that was in front back where it was."""
+        target = client or self.active_id
+        with self._lock:
+            worker = self.clients.get(target or "", {}).get("worker", "")
+        self._commands.put({"cmd": "restore", "client": target, "worker": worker})
 
     def state(self):
         with self._lock:
@@ -329,7 +349,8 @@ class BrowserLink:
                                 data.get("artist", ""), data.get("playing"),
                                 client=data.get("client") or "remote",
                                 visible=data.get("visible"),
-                                focused=data.get("focused"))
+                                focused=data.get("focused"),
+                                diag=data.get("diag"))
                     with self._lock:
                         self.changes = max(self.changes, data.get("changes") or 0)
             except Exception:
@@ -939,7 +960,7 @@ if IS_WINDOWS:
     APPCOMMAND_MEDIA_PREVIOUSTRACK = 12
     APPCOMMAND_MEDIA_PLAY_PAUSE = 14
 
-    VK_SHIFT, VK_OEM_PLUS = 0x10, 0xBB
+    VK_SHIFT, VK_OEM_PLUS, VK_RETURN = 0x10, 0xBB, 0x0D
     VK_H, VK_L = 0x48, 0x4C           # YT Music: -10 s / +10 s
     SW_RESTORE = 9
 
@@ -1699,6 +1720,18 @@ if IS_WINDOWS:
                     set_foreground(previous)
             return True
 
+        def _await_like(self, before, timeout=2.5):
+            """Wait for the page to report a new like state; None if it never did."""
+            if self.link is None:
+                return None
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                state = self.link.liked
+                if state is not None and state != before:
+                    return state
+                time.sleep(0.1)
+            return None
+
         def like(self):
             """Toggle like: the button itself when the debug port is open, else keys.
 
@@ -1710,9 +1743,39 @@ if IS_WINDOWS:
             if state is not None:
                 self._liked, self._liked_at = state, 0.0
                 return True, ("Liked" if state else "Unliked"), state
+            # Chromium drops untrusted events, so the page's own click can land
+            # and do nothing. It leaves the like button focused for exactly this
+            # case: a real Enter keypress at the browser window is trusted input,
+            # and a focused button treats Enter as a click.
+            diag = self.link.diag() if self.link is not None else None
+            click = (diag or {}).get("click") or {}
+            if click.get("buttonFocused"):
+                before = self.link.liked if self.link is not None else None
+                activated = False
+                if not click.get("windowFocused") and self.link is not None:
+                    # The page is behind another tab, so a keystroke would land in
+                    # that one. Let the extension bring its own tab forward first;
+                    # it puts the previous tab back afterwards.
+                    self.link.request_activate()
+                    deadline = time.monotonic() + 2.0
+                    while time.monotonic() < deadline:
+                        current = (self.link.diag() or {}).get("click") or {}
+                        if current.get("windowFocused"):
+                            break
+                        time.sleep(0.1)
+                    activated = True
+                row = self._yt_window()
+                if row is not None and self._type_at(row, [VK_RETURN]):
+                    state = self._await_like(before, timeout=2.5)
+                    if activated and self.link is not None:
+                        self.link.request_restore()
+                    if state is not None:
+                        self._liked, self._liked_at = state, 0.0
+                        return True, ("Liked" if state else "Unliked"), state
+                elif activated and self.link is not None:
+                    self.link.request_restore()
             if self.link is not None and self.link.fresh():
-                # An extension is reporting, so typing at a window is pointless
-                # (and on Chromium it cannot work at all): say what happened
+                # Nothing else can reach this page, so report what happened
                 # instead of pointing at a tab that is already open.
                 return False, "Browser did not click", None
             if self.link is not None and self.link.polls > 0:

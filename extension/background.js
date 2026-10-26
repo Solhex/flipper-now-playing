@@ -50,6 +50,46 @@ async function postState(payload) {
  * run twice. */
 const injectedTabs = new Set();
 
+/* Which tab each reporting client lives in. The bridge cannot press a key at a
+ * background tab (the keystroke would go to whatever tab is in front), so on
+ * request the extension brings the YouTube Music tab forward, holds it there long
+ * enough for the bridge's Enter, and puts the previous tab back. */
+const clientTabs = new Map();
+let restoreTab = null;
+
+function rememberTab(client, sender) {
+  if (!client || !sender || !sender.tab) return;
+  clientTabs.set(client, { tabId: sender.tab.id, windowId: sender.tab.windowId });
+}
+
+async function activateClient(client) {
+  const info = clientTabs.get(client) || clientTabs.values().next().value;
+  if (!info) return false;
+  try {
+    const [active] = await chrome.tabs.query({ active: true, windowId: info.windowId });
+    if (active && active.id !== info.tabId) {
+      restoreTab = { tabId: active.id, windowId: info.windowId };
+    }
+    await chrome.tabs.update(info.tabId, { active: true });
+    await chrome.windows.update(info.windowId, { focused: true });
+    return true;
+  } catch (error) {
+    return false;
+  }
+}
+
+async function restorePreviousTab() {
+  const saved = restoreTab;
+  restoreTab = null;
+  if (!saved) return false;
+  try {
+    await chrome.tabs.update(saved.tabId, { active: true });
+    return true;
+  } catch (error) {
+    return false;
+  }
+}
+
 async function ensureScript(tabId) {
   if (injectedTabs.has(tabId)) return false;
   try {
@@ -119,14 +159,17 @@ async function pollLoop() {
       const data = await response.json();
       clearTimeout(abort);
       if (data && data.cmd === "toggle") forwardToggle(data.title, data.client);
+      else if (data && data.cmd === "activate") await activateClient(data.client);
+      else if (data && data.cmd === "restore") await restorePreviousTab();
     } catch (error) {
       await new Promise((resolve) => setTimeout(resolve, RETRY_MS));
     }
   }
 }
 
-chrome.runtime.onMessage.addListener((message) => {
+chrome.runtime.onMessage.addListener((message, sender) => {
   if (!message || message.type !== "state") return;
+  rememberTab(message.payload && message.payload.client, sender);
   postState(message.payload);
   pollLoop();
 });

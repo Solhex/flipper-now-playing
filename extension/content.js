@@ -188,6 +188,15 @@
       const later = b.getAttribute("aria-pressed");
       lastClick = { ...lastClick, ok: later !== before, before, after: later,
                     at: Date.now() };
+      if (!lastClick.ok) {
+        /* Chromium throws away untrusted events, so the click above can land and
+         * change nothing (verified on Brave). Leave the button focused and say
+         * whether this page is the focused window: the bridge can then press the
+         * button with a real Enter, which the site does honour. */
+        try { b.focus(); } catch (error) { /* ignore */ }
+        lastClick.buttonFocused = document.activeElement === b;
+        lastClick.windowFocused = document.hasFocus();
+      }
       report(true);
     }, 900);
   });
