@@ -9,6 +9,15 @@
  */
 
 const BRIDGE = "http://127.0.0.1:8765";
+
+/* Two extension installs (say Firefox and Brave) both poll the one bridge, and a
+ * command is only delivered to whichever asks first. The id makes that visible in
+ * the bridge log instead of a mystery. Sent as a query parameter, not a header,
+ * so no CORS preflight is involved. */
+const WORKER = (crypto.randomUUID ? crypto.randomUUID() : String(Math.random()).slice(2))
+  .slice(0, 6);
+const BROWSER_NAME = /firefox/i.test(navigator.userAgent) ? "firefox" : "chromium";
+const WHO = `worker=${WORKER}&browser=${BROWSER_NAME}`;
 const RETRY_MS = 2000;
 
 /* Service workers are stopped when idle, so the poll loop must be restartable
@@ -17,7 +26,7 @@ let polling = false;
 
 async function postState(payload) {
   try {
-    await fetch(`${BRIDGE}/state`, {
+    await fetch(`${BRIDGE}/state?${WHO}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
@@ -68,7 +77,7 @@ async function pollLoop() {
       // A hung request must not stop the loop for good: abort it and retry.
       const controller = new AbortController();
       const abort = setTimeout(() => controller.abort(), 25000);
-      const response = await fetch(`${BRIDGE}/wait`, {
+      const response = await fetch(`${BRIDGE}/wait?${WHO}`, {
         cache: "no-store",
         signal: controller.signal,
       });

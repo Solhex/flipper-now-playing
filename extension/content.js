@@ -28,12 +28,18 @@
     return id;
   })();
 
+  let seen = 0;              // toggles that actually reached this tab
+  let lastReject = null;     // ...and why one was ignored, if it was
   let lastActive = Date.now();
   let lastSent = "";
   let lastActivityReport = 0;
   let lastClick = null;
 
-  const button = () => document.querySelector(LIKE);
+  /* Prefer a button that reports a state: a renderer can exist while its button
+   * is still being filled in by the site's own data. */
+  const button = () => document.querySelector(LIKE) ||
+    document.querySelector("ytmusic-like-button-renderer button[aria-pressed]") ||
+    document.querySelector("ytmusic-like-button-renderer button");
   const renderers = () => document.querySelectorAll("ytmusic-like-button-renderer").length;
 
   const likedNow = () => {
@@ -68,7 +74,8 @@
       lastActive,
       /* Proof of what the last click did — "the button is not there" and "the
        * click changed nothing" are indistinguishable from the bridge otherwise. */
-      diag: { button: !!button(), renderers: renderers(), click: lastClick },
+      diag: { button: !!button(), renderers: renderers(), click: lastClick,
+              seen, reject: lastReject },
     };
   }
 
@@ -99,6 +106,44 @@
   window.addEventListener("focus", noteActivity);
   window.addEventListener("blur", () => report(true));
 
+  /* A plain `.click()` is not enough on the real page: it lands, the button is
+   * there, and aria-pressed never changes (verified on Brave — the untrusted
+   * click is ignored). So send the whole pointer sequence a person would, at the
+   * element actually drawn at the button's centre, and report what was in the way
+   * if something else is on top. */
+  function fireLike(el) {
+    const box = el.getBoundingClientRect();
+    const x = Math.round(box.left + box.width / 2);
+    const y = Math.round(box.top + box.height / 2);
+    const at = document.elementFromPoint(x, y) || el;
+    const covered = !(at === el || el.contains(at));
+    const opts = { bubbles: true, cancelable: true, composed: true, view: window,
+                   clientX: x, clientY: y, button: 0, buttons: 1, pointerId: 1,
+                   pointerType: "mouse", isPrimary: true };
+    const sequence = [
+      ["pointerdown", PointerEvent], ["mousedown", MouseEvent],
+      ["pointerup", PointerEvent], ["mouseup", MouseEvent],
+      ["click", MouseEvent],
+    ];
+    /* Exactly one click per target: dispatching the sequence and then calling
+     * .click() as well fires it twice, which toggles the like straight back. */
+    for (const target of covered && at !== el ? [at, el] : [el]) {
+      for (const [type, Kind] of sequence) {
+        const eventOpts = type === "click"
+          ? { ...opts, buttons: 0 }
+          : opts;
+        try {
+          target.dispatchEvent(new Kind(type, eventOpts));
+        } catch (e) { /* ignore: a site-specific element may reject an event */ }
+      }
+    }
+    return {
+      tag: at.tagName ? `${at.tagName.toLowerCase()}${at.id ? "#" + at.id : ""}` : "?",
+      disabled: el.hasAttribute("disabled") || el.getAttribute("aria-disabled") === "true",
+      covered, w: Math.round(box.width), h: Math.round(box.height),
+    };
+  }
+
   const sameTrack = (wanted) => {
     if (!wanted) return true;                 // no target: act, as before
     const mine = (trackInfo().title || "").trim().toLowerCase().slice(0, 24);
@@ -111,8 +156,18 @@
    * The track name is a second guard in case ids went stale. */
   chrome.runtime.onMessage.addListener((message) => {
     if (!message || message.type !== "toggle") return;
-    if (message.client && message.client !== CLIENT) return;
-    if (!sameTrack(message.title)) return;
+    seen += 1;
+    if (message.client && message.client !== CLIENT) {
+      lastReject = `other tab (${message.client})`;
+      report(true);
+      return;
+    }
+    if (!sameTrack(message.title)) {
+      lastReject = `other track (${String(message.title).slice(0, 20)})`;
+      report(true);
+      return;
+    }
+    lastReject = null;
 
     const b = button();
     if (!b) {
@@ -121,13 +176,13 @@
       return;
     }
     const before = b.getAttribute("aria-pressed");
-    b.click();
-    lastClick = { ok: false, before, checked: true, at: Date.now() };
+    lastClick = { ok: false, before, checked: true, at: Date.now(), ...fireLike(b) };
     setTimeout(() => {
       const later = b.getAttribute("aria-pressed");
-      lastClick = { ok: later !== before, before, after: later, at: Date.now() };
+      lastClick = { ...lastClick, ok: later !== before, before, after: later,
+                    at: Date.now() };
       report(true);
-    }, 700);
+    }, 900);
   });
 
   /* aria-pressed flips whenever the track changes or someone likes it, so a

@@ -38,6 +38,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -216,7 +217,8 @@ class BrowserLink:
 
     # ---- state
     def update(self, liked, title="", artist="", playing=None, client=None,
-               visible=None, focused=None, last_active=None, diag=None):
+               visible=None, focused=None, last_active=None, diag=None,
+               worker=""):
         """Record one tab's report and re-pick which tab the bridge follows."""
         client_id = client or "default"
         with self._lock:
@@ -224,6 +226,7 @@ class BrowserLink:
             record.update(liked=liked, title=title or "", artist=artist or "",
                           playing=playing, visible=visible, focused=focused,
                           lastActive=last_active, diag=diag,
+                          worker=worker or record.get("worker", ""),
                           updated=time.monotonic())
             self.requests += 1
         return self._reselect()
@@ -285,7 +288,11 @@ class BrowserLink:
                     "fresh": self._select() is not None}
 
     # ---- commands
-    def request_toggle(self, title="", client=None):
+    def request_toggle(self, title="", client=None, worker=""):
+        if not worker:
+            target = client or self.active_id
+            with self._lock:
+                worker = self.clients.get(target or "", {}).get("worker", "")
         if self.remote_base:
             try:
                 request = urllib.request.Request(
@@ -297,7 +304,8 @@ class BrowserLink:
                 print("  toggle: could not reach the running bridge:", exc)
             return
         self._commands.put({"cmd": "toggle", "title": title,
-                            "client": client or self.active_id})
+                            "client": client or self.active_id,
+                            "worker": worker})
 
     def _answers(self):
         try:
@@ -372,11 +380,13 @@ class BrowserLink:
                 except ValueError:
                     self._reply(400)
                     return
+                query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                 changed = link.update(
                     data.get("liked"), data.get("title", ""), data.get("artist", ""),
                     data.get("playing"), client=data.get("client"),
                     visible=data.get("visible"), focused=data.get("focused"),
-                    last_active=data.get("lastActive"), diag=data.get("diag"))
+                    last_active=data.get("lastActive"), diag=data.get("diag"),
+                    worker=query.get("worker", [""])[0])
                 if changed:
                     print(f"  <- browser: liked={link.liked} ({link.title[:30]!r}) "
                           f"[{link.active_id}{', focused' if data.get('focused') else ''}]")
@@ -386,14 +396,38 @@ class BrowserLink:
                 if self.path.startswith("/wait"):
                     with link._lock:
                         link.polls += 1
+                    query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                    worker = query.get("worker", [""])[0]
+                    browser = query.get("browser", [""])[0]
                     started = time.monotonic()
-                    try:
-                        command = link._commands.get(timeout=link.wait_timeout)
-                    except queue.Empty:
-                        command = {"cmd": None}
+                    deadline = started + link.wait_timeout
+                    command = {"cmd": None}
+                    while True:
+                        left = deadline - time.monotonic()
+                        if left <= 0:
+                            break
+                        try:
+                            candidate = link._commands.get(timeout=left)
+                        except queue.Empty:
+                            break
+                        wanted = candidate.get("worker")
+                        if wanted and worker and wanted != worker:
+                            # Another install (say the Firefox one) asked first.
+                            # Handing it over would click in the wrong browser, so
+                            # put it back for the worker that owns the tab.
+                            link._commands.put(candidate)
+                            time.sleep(0.05)
+                            continue
+                        command = candidate
+                        break
                     if command.get("cmd"):
+                        wanted = command.get("worker")
+                        note = ""
+                        if wanted and worker and wanted != worker:
+                            note = f" (WANTED worker {wanted}!)"
                         print(f"  <- extension picked up "
-                              f"{command['cmd']} after {time.monotonic() - started:.1f}s")
+                              f"{command['cmd']} after {time.monotonic() - started:.1f}s"
+                              f" by worker {worker or '?'}{'/' + browser if browser else ''}{note}")
                     self._reply(200, json.dumps(command).encode())
                 else:
                     self._reply(200, json.dumps(link.state()).encode())
