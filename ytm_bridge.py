@@ -37,6 +37,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
 from pathlib import Path
 
 from PIL import Image
@@ -199,6 +200,7 @@ class BrowserLink:
         self._lock = threading.Lock()
         self._server = None
         self._thread = None
+        self.remote_base = ""
         self.error = ""
 
     # ---- state
@@ -225,7 +227,40 @@ class BrowserLink:
 
     # ---- commands
     def request_toggle(self):
+        if self.remote_base:
+            try:
+                request = urllib.request.Request(f"{self.remote_base}/toggle",
+                                                 data=b"{}", method="POST")
+                urllib.request.urlopen(request, timeout=5).read()
+            except Exception as exc:
+                print("  toggle: could not reach the running bridge:", exc)
+            return
         self._commands.put({"cmd": "toggle"})
+
+    def _answers(self):
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{self.port}/state", timeout=1.5) as reply:
+                data = json.load(reply)
+            return "liked" in data and "polls" in data
+        except Exception:
+            return False
+
+    def _mirror(self):
+        """Follow the running bridge's state while this process only helps out."""
+        while True:
+            try:
+                with urllib.request.urlopen(f"{self.remote_base}/state", timeout=3) as reply:
+                    data = json.load(reply)
+                if data.get("fresh"):
+                    with self._lock:
+                        self.liked = data.get("liked")
+                        self.title = data.get("title", "")
+                        self.artist = data.get("artist", "")
+                        self.playing = data.get("playing")
+                        self.updated = time.monotonic()
+            except Exception:
+                pass
+            time.sleep(1.0)
 
     # ---- server
     def start(self):
@@ -290,12 +325,28 @@ class BrowserLink:
             def log_message(self, format, *args):
                 pass                        # a poll every second is not news
 
+        # Ask before binding: on Windows SO_REUSEADDR lets a second process bind
+        # the same port, which would quietly split the extension's reports between
+        # two servers. A live answer here means the real bridge owns the port.
+        if self._answers():
+            self.remote_base = f"http://127.0.0.1:{self.port}"
+            threading.Thread(target=self._mirror, daemon=True,
+                             name="ytm-browser-link-mirror").start()
+            print(f"Using the running bridge on port {self.port} for the like state")
+            return True
+
         try:
             server = ThreadingHTTPServer(("127.0.0.1", self.port), Handler)
         except OSError as exc:
+            # The port is taken — almost always by an already-running bridge. Then
+            # this process is a helper (--dump, --cmd) and asks *that* one instead
+            # of hosting: the extension can only report to a single owner.
             self.error = str(exc)
-            print(f"Browser extension bridge unavailable on port {self.port}: {exc}")
-            return False
+            self.remote_base = f"http://127.0.0.1:{self.port}"
+            threading.Thread(target=self._mirror, daemon=True,
+                             name="ytm-browser-link-mirror").start()
+            print(f"Using the running bridge on port {self.port} for the like state")
+            return True
         server.daemon_threads = True
         self._server = server
         self._thread = threading.Thread(target=server.serve_forever, daemon=True,
@@ -2137,7 +2188,9 @@ async def dump_once(bridge, wait=12.0):
     print(f"volume   : {'?' if meta['vol'] is None else str(meta['vol']) + '%'}")
     print(f"art      : {'none' if not meta['art'] else 'yes'}")
     liked = meta.get("liked")
-    print(f"liked    : {'?' if liked is None else ('yes' if liked else 'no')}")
+    link = getattr(bridge.backend, "link", None)
+    source = "  (browser extension)" if (link is not None and link.fresh()) else ""
+    print(f"liked    : {'?' if liked is None else ('yes' if liked else 'no')}{source}")
 
     if meta["art"]:
         try:

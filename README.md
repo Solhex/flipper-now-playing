@@ -18,6 +18,7 @@ two exchange raw byte frames.
 | `application.fam`| Manifest (`requires=["bt"]`, category `Bluetooth`)        |
 | `ytm_bridge.py`  | PC side: media session -> BLE, buttons -> the player       |
 | `windows_startup.py` | Windows: registers the bridge to start at logon        |
+| `extension/`     | browser add-on: like state -> bridge, bridge -> click  |
 
 ## Build and flash
 
@@ -68,7 +69,8 @@ py -3 -m venv .venv
 from — see [Liked state](#liked-state-the-heart).
 
 `--dump` and `--cmd` (one button, e.g. `--cmd p`) need no Flipper, which is the
-quickest way to tell a bridge problem from a device problem. On the Flipper:
+quickest way to tell a bridge problem from a device problem. Load the browser
+extension (below) to get the like state on any browser.
 launch **YT Music Remote** (Apps -> Bluetooth), Bluetooth ON.
 
 The pieces differ underneath:
@@ -239,6 +241,12 @@ curl -s 127.0.0.1:8765/state     # liked / title / reports / polls / fresh
 curl -s -X POST 127.0.0.1:8765/toggle    # what holding OK sends the page
 ```
 
+`--dump` and `--cmd` work while the bridge is running: when port 8765 is already
+owned they read the state from the running bridge instead of starting a second
+server, and say so (`Using the running bridge on port 8765 for the like state`).
+The state is labelled `(browser extension)` in `--dump` when that is where it came
+from.
+
 `extension/test/` holds the harness used to verify this: a mock page with the
 site's like-button DOM, and a script that loads the extension into a headless
 Chromium browser and drives the bridge
@@ -296,6 +304,9 @@ knowing:
   `zwp_virtual_keyboard_manager_v1` — what sway advertises here — and sets the
   shift modifier through the protocol's `modifiers` request, because pressing the
   shift keycode does not work.
+- The browser extension described under [Liked state](#liked-state-the-heart)
+  works the same on Linux: it is the only route that does not depend on the
+  window manager (`swaymsg`) or on typing at a window.
 - Check the toast path without touching the buttons:
   `python3 ytm_bridge.py --name Gumi --toast "hello"` (needs the service stopped,
   since only one connection can hold the device).
