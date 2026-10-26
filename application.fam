@@ -1,0 +1,16 @@
+# Flipper Zero app manifest — see documentation/AppManifests.md in the firmware repo
+
+App(
+    appid="ytm_remote",
+    name="YT Music Remote",
+    apptype=FlipperAppType.EXTERNAL,
+    entry_point="ytm_remote_app",
+    stack_size=4 * 1024,
+    fap_category="Bluetooth",
+    fap_version="0.2",
+    fap_icon="ytm_remote.png",  # 10x10 1-bit PNG
+    fap_description="Show and control YouTube Music on your PC over Bluetooth",
+    fap_author="fvern",
+    fap_icon_assets="images",
+    requires=["bt", "notification", "storage"],
+)
