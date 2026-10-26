@@ -37,6 +37,15 @@
 #include <stdio.h>
 #include <string.h>
 
+/* A bounded strnlen. The firmware API carries strnlen but has it disabled, and
+ * the CI symbol check refuses any app that calls it — the local SDK build does
+ * not catch this, it passed while CI failed. Going through memchr keeps this on
+ * symbols the firmware exposes, and the compiler will not rewrite it back. */
+static size_t bounded_len(const char* s, size_t max) {
+    const char* end = memchr(s, '\0', max);
+    return end ? (size_t)(end - s) : max;
+}
+
 #define TAG "YtmRemote"
 
 #define TEXT_MAX       80 /* title/artist buffers */
@@ -876,14 +885,14 @@ static bool handle_meta(App* app, const uint8_t* b, uint16_t len) {
         const char* p = (const char*)(b + 5);
         uint16_t rem = len - 5;
 
-        size_t tl = strnlen(p, rem);
+        size_t tl = bounded_len(p, rem);
         if(tl >= sizeof(title)) tl = sizeof(title) - 1;
         memcpy(title, p, tl);
 
         if(tl + 1 < rem) {
             const char* q = p + tl + 1;
             size_t rl = rem - tl - 1;
-            size_t al = strnlen(q, rl);
+            size_t al = bounded_len(q, rl);
             if(al >= sizeof(artist)) al = sizeof(artist) - 1;
             memcpy(artist, q, al);
         }
