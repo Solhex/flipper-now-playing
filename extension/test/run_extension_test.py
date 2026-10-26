@@ -27,7 +27,7 @@ BROWSERS = [
 
 
 def serve_pages():
-    pages = ROOT / "test"          # the mock page, not the build being tested
+    pages = ROOT          # this folder holds the mock page, whatever build is tested
     handler = lambda *a, **k: SimpleHTTPRequestHandler(*a, directory=str(pages), **k)
     server = ThreadingHTTPServer(("127.0.0.1", PAGE_PORT), handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
