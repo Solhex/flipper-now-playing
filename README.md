@@ -343,6 +343,10 @@ redrawing the screen.
   `Connected. write=… notify=…` line: `notify` must be `…228e61fe0000`
   (the indicate-only TX char). Pointing it at the flow-control char `…228e63…`
   is silent but harmless-looking, which is exactly how it hid for a while.
+- **Build fails with `__pycache__/...pyc: file format not recognized`.** `scons`
+  links every file it finds beside the sources, so a stray `.pyc` (say, from
+  running `python -m py_compile` in the project folder) is handed to the linker.
+  Delete `__pycache__` and build again.
 - **`ufbt launch` says `Application "YT Music Remote" has to be closed
   manually`.** The firmware refuses to close a running app over RPC or the CLI:
   press Back on the Flipper (long-press with this build), then launch again.
