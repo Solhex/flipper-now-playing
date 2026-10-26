@@ -693,20 +693,20 @@ class MprisBackend:
         """
         state = link_toggle(self.link)
         if state is not None:
-            return True, ("Liked" if state else "Unlike toggled")
+            return True, ("Liked" if state else "Unliked"), state
 
         vkkey = Path.home() / ".local/share/ytm-remote/bin/vkkey"
         if not vkkey.exists():
-            return False, "Like: vkkey missing"
+            return False, "Like: vkkey missing", None
 
         windows = sway_windows()
         if not windows:
-            return False, "Like: cannot check focus"
+            return False, "Like: cannot check focus", None
 
         previous = windows[0][0] if windows[0][2] else None
         target = next((w for w in windows if "youtube music" in w[1].lower()), None)
         if target is None:
-            return False, "Open the YT Music tab"
+            return False, "Open the YT Music tab", None
 
         moved = False
         try:
@@ -716,12 +716,12 @@ class MprisBackend:
                 time.sleep(0.35)      # let the focus change land before typing
             subprocess.run([str(vkkey), "-m", "1", "13"], capture_output=True, timeout=5)
         except Exception as e:
-            return False, f"Like failed: {e}"
+            return False, f"Like failed: {e}", None
         finally:
             if moved and previous:
                 time.sleep(0.15)
                 swaymsg(f"[con_id={previous}] focus")   # give focus back
-        return True, "Like toggled"
+        return True, "Like toggled", None
 
 
 def sway_socket():
@@ -1538,19 +1538,19 @@ if IS_WINDOWS:
             state = link_toggle(self.link)
             if state is not None:
                 self._liked, self._liked_at = state, 0.0
-                return True, ("Liked" if state else "Unlike toggled")
+                return True, ("Liked" if state else "Unliked"), state
 
             if self._debug is not None:
                 state = self._debug.toggle(self._title)
                 if state is not None:
                     self._liked, self._liked_at = state, 0.0
-                    return True, ("Liked" if state else "Unlike toggled")
+                    return True, ("Liked" if state else "Unliked"), state
             row = self._yt_window()
             if row is None:
-                return False, "Open the YT Music tab"
+                return False, "Open the YT Music tab", None
             if not self._type_at(row, [(VK_SHIFT, VK_OEM_PLUS)]):
-                return False, "Like: cannot focus"
-            return True, "Like toggled"
+                return False, "Like: cannot focus", None
+            return True, "Like toggled", None
 
 
 # ---------------------------------------------------------------- imaging
@@ -1598,9 +1598,15 @@ def meta_frame(m, with_text=True):
     return frame(FRAME_META, payload)
 
 
-def toast_frame(text):
-    """One short line for the device to show for a moment."""
-    return frame(FRAME_TOAST, text.encode("utf-8", "replace")[:TOAST_MAX])
+def toast_frame(text, icon=0):
+    """One short line for the device to show for a moment.
+
+    The first payload byte is an icon id (0 none, 1 heart, 2 broken heart) that
+    the device draws before the text, so "Liked" can arrive with a heart beside
+    it — the LCD fonts have no such glyph.
+    """
+    body = text.encode("utf-8", "replace")[:TOAST_MAX - 1]
+    return frame(FRAME_TOAST, bytes([max(0, min(2, int(icon)))]) + body)
 
 
 def art_frame(art):
@@ -1992,11 +1998,11 @@ class Bridge:
         await self.write(vol_frame(level))
         self.last_vol = level
 
-    async def toast(self, text):
+    async def toast(self, text, icon=0):
         """Show a short message on the device (the like outcome, say)."""
         if self.write_char is None:
             return
-        await self.write(toast_frame(text))
+        await self.write(toast_frame(text, icon))
 
     async def on_notify(self, _char, data: bytearray):
         loop = asyncio.get_event_loop()
@@ -2023,9 +2029,10 @@ class Bridge:
                 elif ch == "+":
                     self.clock.nudge(self.backend.seek_step)
             elif ch == CMD_LIKE:
-                ok, message = await loop.run_in_executor(None, self.backend.like)
+                ok, message, state = await loop.run_in_executor(None, self.backend.like)
+                icon = 1 if state is True else (2 if state is False else 0)
                 print(f"  <- like: {message}" + ("" if ok else " (nothing typed)"))
-                await self.toast(message)
+                await self.toast(message, icon)
 
     async def push(self, m):
         if self.write_char is None:
@@ -2061,9 +2068,12 @@ class Bridge:
 
         liked = LIKE_UNKNOWN if m.get("liked") is None else (
             LIKE_YES if m["liked"] else LIKE_NO)
-        if liked != self.last_liked:
+        # Also resent when the track changes: the state lives per track, and one
+        # dropped frame would otherwise leave the heart wrong for the whole song.
+        like_key = (liked, m["title"])
+        if like_key != self.last_liked:
             await self.write(like_frame(liked))
-            self.last_liked = liked
+            self.last_liked = like_key
             if liked != LIKE_UNKNOWN:
                 print(f"  -> like {'yes' if liked == LIKE_YES else 'no'}")
 
@@ -2263,7 +2273,7 @@ async def main_async(args):
             level = backend.volume(CMD_VOLUME[args.cmd])
             print("volume:", "unavailable" if level is None else f"{level}%")
         elif args.cmd == "l":
-            ok, message = backend.like()
+            ok, message, _state = backend.like()
             print("like:", message, "" if ok else "(nothing typed)")
         else:
             await backend.command(args.cmd)

@@ -209,6 +209,7 @@ struct App {
     uint32_t song_cooldown; /* tick until which Up/Down is ignored */
 
     uint8_t liked; /* 0 = not liked, 1 = liked, 2 = unknown (nothing drawn) */
+    uint8_t toast_icon; /* TOAST_ICON_* drawn before the toast text */
 
     uint8_t volume; /* last volume reported by the PC, 0..100 */
     bool have_vol; /* PC has reported a volume at least once */
@@ -692,6 +693,21 @@ static const uint8_t HEART_BITS[] = {
     0x18, /* ...##... */
 };
 
+/* The same heart with a crack through it, for "not liked". */
+static const uint8_t HEART_BROKEN[] = {
+    0x66, /* .##..##. */
+    0xF7, /* ###.#### */
+    0xD7, /* ###.#.## */
+    0x6E, /* .###.##. */
+    0x2C, /* ..##.#.. */
+    0x08, /* ...#.... */
+};
+
+/* Which icon rides beside a toast line (0 = none). */
+#define TOAST_ICON_NONE 0
+#define TOAST_ICON_HEART 1
+#define TOAST_ICON_BROKEN 2
+
 /* The now-playing screen: cover, progress bar, times, and the marquee. */
 static void draw_now_playing(Canvas* canvas, App* app) {
     if(!app->have_meta && !app->have_art) {
@@ -759,13 +775,14 @@ static void draw_now_playing(Canvas* canvas, App* app) {
      * tall, so a cut-out is the only way to keep both visible. Only "liked"
      * draws anything: unknown and not-liked leave the bar untouched, so the
      * screen never claims something the PC cannot see. */
-    if(app->liked == 1 && h >= HEART_H) {
+    if(app->liked != 2 && h >= HEART_H) {
+        const uint8_t* icon = app->liked == 1 ? HEART_BITS : HEART_BROKEN;
         int hx = 2 + (124 - HEART_W) / 2;
         int hy = bar_y + (h - HEART_H) / 2;
         canvas_set_color(canvas, ColorWhite);
         canvas_draw_box(canvas, hx, hy, HEART_W, HEART_H);
         canvas_set_color(canvas, ColorBlack);
-        canvas_draw_xbm(canvas, hx, hy, HEART_W, HEART_H, HEART_BITS);
+        canvas_draw_xbm(canvas, hx, hy, HEART_W, HEART_H, icon);
     }
 
     char elapsed[12], total[12];
@@ -811,7 +828,18 @@ static void draw_toast(Canvas* canvas, App* app) {
     canvas_set_color(canvas, ColorWhite);
     canvas_draw_frame(canvas, x, y, w, 24);
     canvas_set_font(canvas, FontSecondary);
-    canvas_draw_str_aligned(canvas, 64, y + 15, AlignCenter, AlignBottom, app->toast);
+    /* Icon + text centred as one group, so "Liked" with a heart does not look
+     * lopsided the way a centred string plus a fixed icon would. */
+    int text_w = canvas_string_width(canvas, app->toast);
+    int gap = app->toast_icon ? HEART_W + 2 : 0;
+    int tx = 64 - (text_w + gap) / 2;
+    if(tx < x + 3) tx = x + 3;
+    if(app->toast_icon == TOAST_ICON_HEART) {
+        canvas_draw_xbm(canvas, tx, y + 9, HEART_W, HEART_H, HEART_BITS);
+    } else if(app->toast_icon == TOAST_ICON_BROKEN) {
+        canvas_draw_xbm(canvas, tx, y + 9, HEART_W, HEART_H, HEART_BROKEN);
+    }
+    canvas_draw_str(canvas, tx + gap, y + 15, app->toast);
     canvas_set_color(canvas, ColorBlack);
 }
 
@@ -998,12 +1026,22 @@ static bool handle_like(App* app, const uint8_t* b, uint16_t len) {
 
 /* A short message from the PC — how the like went, say. Shown for a moment;
  * the loop clears it, like the volume overlay. */
+/* Payload: [icon:1][text...]. An older PC sends text only, which is why the
+ * icon is read only when the first byte is a known icon id and more follows. */
 static bool handle_toast(App* app, const uint8_t* b, uint16_t len) {
     if(len == 0 || len > TOAST_MAX) return false;
+
+    uint8_t icon = TOAST_ICON_NONE;
+    if(len > 1 && b[0] <= TOAST_ICON_BROKEN) {
+        icon = b[0];
+        b++;
+        len--;
+    }
 
     furi_mutex_acquire(app->mutex, FuriWaitForever);
     memcpy(app->toast, b, len);
     app->toast[len] = 0;
+    app->toast_icon = icon;
     app->toast_until = furi_get_tick() + TOAST_SHOW_MS;
     app->toast_clear_pending = true;
     furi_mutex_release(app->mutex);

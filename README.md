@@ -214,8 +214,10 @@ right after the track changed.
 
 ## Liked state (the heart)
 
-The track screen draws a small heart after the elapsed time when the current
-track is liked. Nothing in MPRIS or the Windows media session exposes that — only
+The track screen draws a small heart in the middle of the progress bar when the
+current track is liked, and a cracked heart when it is not; an unknown state draws
+nothing. Holding OK shows `Liked` / `Unliked` with the matching icon beside it.
+Nothing in MPRIS or the Windows media session exposes that — only
 the page knows — so the bridge asks the page. There are two ways to ask it, and
 the bridge uses whichever is available:
 
@@ -346,7 +348,9 @@ advertise notify — yields a link where metadata flows but buttons appear dead.
                which is what keeps the per-tick frame inside one BLE write.
       0x02 ART : [w:1][h:1][1-bit rows, (w+7)/8 per row, LSB-first per byte]
       0x03 VOL : [volume:1]  percent, 0..100 — shows the volume overlay
-      0x05 LIKE: [state:1]   0 = not liked, 1 = liked, 2 = unknown — draws a heart
+      0x04 TOAST: [icon:1][text utf8] — a moment-long line; icon 0 none,
+               1 heart, 2 broken heart (the LCD font has no heart glyph)
+      0x05 LIKE: [state:1]   0 = not liked, 1 = liked, 2 = unknown
 
 Flipper -> PC: a single command byte (`p` `n` `b` `-` `+` `u` `d`; `u`/`d` are
 the volume keys). Unknown frame types and oversized payloads are dropped and the
