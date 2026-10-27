@@ -185,9 +185,18 @@ class MprisParsingTests(unittest.TestCase):
 
     def test_seek_step_matches_the_site(self):
         # YouTube Music's own seek controls step 5 s, so the device must not
-        # jump 10 (the h/l shortcuts live only on the Windows-Firefox path).
+        # jump 10.
         self.assertEqual(y.SEEK_STEP, 5)
         self.assertEqual(y.MprisBackend.seek_step, y.SEEK_STEP)
+
+    def test_the_keystroke_path_lands_on_the_same_distance(self):
+        # The Windows-Firefox path can only tap YouTube Music's 1-second
+        # shortcut, so it must derive its tap count from SEEK_STEP rather than
+        # carry a distance of its own.
+        self.assertEqual(y.YT_SEEK_TAP_S, 1)
+        self.assertEqual(y.SEEK_STEP % y.YT_SEEK_TAP_S, 0)
+        self.assertEqual(int(round(y.SEEK_STEP / y.YT_SEEK_TAP_S)) * y.YT_SEEK_TAP_S,
+                         y.SEEK_STEP)
 
 
 class TrackUrlTests(unittest.TestCase):

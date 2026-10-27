@@ -212,6 +212,13 @@ resyncs, so either host can be updated without breaking a build already on the
 device. Each frame type is one entry in `FRAME_SPECS` in `ytm_remote.c`, carrying
 both its length bound and its handler.
 
+**Seek distance** is one constant (`SEEK_STEP`, 5 s) on every path — the Flipper
+sends `-`/`+` and the host decides how far. The exception that looks like one but
+isn't: Firefox on Windows has no seek API, so that path types at the tab, and it
+taps YouTube Music's *1-second* shortcut (`Shift+H`/`Shift+L`) `SEEK_STEP` times
+rather than carrying a distance of its own. Plain `h`/`l` would move 10 s and
+disagree with the device.
+
 **Useful bridge flags:** `--name`, `--player`, `--hz` (default 20), `--dump`,
 `--cmd`, `--pair`, `--wait-for-player`, `--toast "text"`, `--ext-port 0` /
 `--firefox-port 0` (turn the like sources off).

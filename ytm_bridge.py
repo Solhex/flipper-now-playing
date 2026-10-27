@@ -55,15 +55,16 @@ IS_WINDOWS = sys.platform == "win32"
 ART_SIZE = 44          # px, square; the largest cover that still leaves a row
                        # between it and the bar (64 rows: cover 44 + bar 7 + time 8)
 # Seconds per seek tap. YouTube Music's own seek controls — the ⟲/⟳ buttons and
-# the arrow keys — step 5 s, and that is what the device should match, so the
-# paths that can choose an amount (MPRIS on Linux, SMTC on Windows, the browser
-# extension) all move exactly this.
+# the arrow keys — step 5 s, and that is what the device should match, so every
+# path moves exactly this: MPRIS on Linux, SMTC on Windows, the browser
+# extension, and the keystroke path below.
 SEEK_STEP = 5
-# The one path that cannot choose: Firefox on Windows has no seek API, so the
-# bridge types YouTube Music's own shortcut at the tab. h/l are the shortcuts
-# that work without the seek bar having focus, and they step 10 s. Named here so
-# the log tells the truth instead of implying the key obeys SEEK_STEP.
-FIREFOX_SEEK_STEP = 10
+# The one path that cannot ask for a distance is Firefox on Windows: it has no
+# seek API, so the bridge types a YouTube Music shortcut at the tab. Its h/l
+# shortcuts step 10 s, but Shift+H / Shift+L step 1 s — so that path taps the
+# 1-second shortcut SEEK_STEP times and lands on the same 5 s as everywhere
+# else, from the same constant.
+YT_SEEK_TAP_S = 1
 VOLUME_STEP = 0.05     # fraction of full scale per volume key press
 POLL_HZ = 20           # metadata pushes per second (override with --hz)
 POLL_HZ_MAX = 25
@@ -1647,7 +1648,7 @@ if IS_WINDOWS:
                 print(f"  !! command {ch!r} failed: {exc}")
 
         async def seek(self, direction):
-            """±SEEK_STEP, except on Firefox where the h/l shortcut decides."""
+            """±SEEK_STEP on every path, including the keystroke one."""
             session = self.session
             if session is None:
                 return
@@ -1657,10 +1658,16 @@ if IS_WINDOWS:
                 if row is None:
                     print("  !! seek: no Firefox window to address")
                     return
-                key = VK_L if direction > 0 else VK_H
-                if self._type_at(row, [key]):
-                    print(f"  <- seek {'+' if direction > 0 else '-'}{FIREFOX_SEEK_STEP}s "
-                          f"-> Firefox shortcut {'l' if direction > 0 else 'h'}")
+                # No seek API in Firefox's media session, so tap the 1-second
+                # shortcut until the distance matches what every other platform
+                # moves. Shift+L forward, Shift+H back (plain l/h would jump
+                # 10 s and disagree with the device).
+                chord_key = (VK_SHIFT, VK_L if direction > 0 else VK_H)
+                taps = max(1, int(round(self.seek_step / YT_SEEK_TAP_S)))
+                if self._type_at(row, [chord_key] * taps):
+                    print(f"  <- seek {'+' if direction > 0 else '-'}"
+                          f"{taps * YT_SEEK_TAP_S}s -> {taps} x YT Music "
+                          f"{'Shift+L' if direction > 0 else 'Shift+H'} ({YT_SEEK_TAP_S}s each)")
                 return
 
             try:
