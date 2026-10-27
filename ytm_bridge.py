@@ -33,6 +33,7 @@ import io
 import json
 import os
 import shutil
+import signal
 import socket
 import queue
 import subprocess
@@ -672,8 +673,9 @@ class FirefoxDebug:
             if "active sessions" in self.error:
                 # Firefox allows one BiDi session at a time. Either the bridge is
                 # already holding it (normal) or a crashed client left it stuck.
-                self.error = ("another client holds Firefox's debug session "
-                              "(stop the bridge, or restart Firefox)")
+                self.error = ("another client holds Firefox's debug session - "
+                              "restart Firefox once to release it (this bridge "
+                              "reconnects on its own)")
             self.close()
             return False
 
@@ -2788,7 +2790,12 @@ async def main_async(args):
 
     bridge = Bridge(backend, args.name, args.hz, args.address)
     print(f"Polling at {bridge.hz:g} Hz")
-    await bridge.run()
+    try:
+        await bridge.run()
+    finally:
+        # Releases the Firefox debug session on the way out; see
+        # install_shutdown_handler for why that is not optional.
+        backend.close()
     return 0
 
 
@@ -2811,6 +2818,26 @@ def setup_log(path, max_bytes=2_000_000):
     sys.stdout = handle
     sys.stderr = handle
     return handle
+
+
+def install_shutdown_handler():
+    """Turn a service stop into a clean exit.
+
+    systemd stops the bridge with SIGTERM, and Python's default for that kills
+    the process where it stands: no finally blocks, no atexit. That matters
+    because Firefox allows one WebDriver BiDi session at a time and does not drop
+    one whose client simply disappeared - so a restarted bridge finds the debug
+    socket held by a session nobody owns, cannot read the like state, and the
+    like quietly falls back to typing at a focused window until Firefox is
+    restarted too. That is a live bug this handler exists to stop.
+
+    Raising SystemExit instead unwinds the normal way, so the session is closed
+    as the process leaves.
+    """
+    def stop(_signum, _frame):
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, stop)
 
 
 def main():
@@ -2857,6 +2884,7 @@ def main():
     except Exception:
         pass
 
+    install_shutdown_handler()
     try:
         sys.exit(asyncio.run(main_async(args)) or 0)
     except KeyboardInterrupt:

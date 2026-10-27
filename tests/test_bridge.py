@@ -11,6 +11,7 @@ back byte by byte the way the device does.
 import asyncio
 import io
 import json
+import signal
 import socket
 import sys
 import threading
@@ -407,6 +408,25 @@ class TransportRetryTests(unittest.TestCase):
         backend, calls = self.backend([True])
         asyncio.run(backend.command("p"))
         self.assertEqual(len(calls), 1)
+
+
+class ShutdownHandlerTests(unittest.TestCase):
+    def test_sigterm_unwinds_instead_of_killing_the_process(self):
+        # systemd stops the bridge with SIGTERM, and Python's default for that
+        # skips every finally and atexit. Without this handler the Firefox debug
+        # session leaks on each restart, and the like quietly degrades to typing
+        # at a window until Firefox is restarted as well.
+        if threading.current_thread() is not threading.main_thread():
+            self.skipTest("signals can only be installed from the main thread")
+        before = signal.getsignal(signal.SIGTERM)
+        try:
+            y.install_shutdown_handler()
+            handler = signal.getsignal(signal.SIGTERM)
+            self.assertTrue(callable(handler))
+            with self.assertRaises(SystemExit):
+                handler(signal.SIGTERM, None)
+        finally:
+            signal.signal(signal.SIGTERM, before)
 
 
 class PlayerRefollowTests(unittest.TestCase):
