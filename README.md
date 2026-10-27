@@ -293,7 +293,7 @@ disagree with the device.
   `YTM_TEST_BROWSER=/usr/bin/brave python3 extension/test/run_extension_test.py`
   - builds its own bridge on a free port, so your setup is untouched.
 
-**Screensaver knobs** (top of `ytm_remote.c`): `WAVE_COUNT`, `WAVE_FRAME_MS`,
-`WAVE_WINDOW`, `WAVE_SPEED_MIN`, `WAVE_SPEED_STEP`. The screen sleeps after 10 s
-idle (`SCREENSAVER_SLEEP_MS`); any key wakes it and is swallowed. BLE keeps
-advertising while dark, so the host can connect at any time.
+**While no PC is connected** the device shows a static "Waiting for PC" screen
+(`draw_waiting` in `ytm_remote.c`): what the app is waiting for, in words. There
+is no screensaver and the backlight is left to the firmware's own setting. BLE
+keeps advertising, so the host can connect at any time.

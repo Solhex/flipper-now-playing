@@ -34,7 +34,6 @@
 #include <notification/notification_messages.h>
 #include <storage/storage.h>
 #include <ytm_remote_icons.h>
-#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -64,24 +63,6 @@ static size_t bounded_len(const char* s, size_t max) {
  * on Long and ignoring Up/Down for a moment afterwards is what keeps a hold
  * from also nudging the volume. */
 #define SONG_COOLDOWN_MS 1500
-
-/* Idle screen: flowing lines while nothing is paired. Once the screen has been
- * on it for SCREENSAVER_SLEEP_MS without a keypress it lets the backlight go
- * out; any key wakes it again (and is swallowed, so it cannot act on a dark
- * screen).
- *
- * The panel ghosts when pixels change quickly, so each frame is kept almost
- * free: the curves hold their shape and only the lit part of each slides along
- * it, so just the two end columns change (~8 px per frame for all twelve lines,
- * against ~9000 when the curves also drifted). That budget is what pays for
- * having this many lines. Set WAVE_WINDOW to 128 for whole lines (still cheap:
- * the cost is in what changes, not what is lit). */
-#define SCREENSAVER_SLEEP_MS 10000
-#define WAVE_COUNT           12
-#define WAVE_FRAME_MS        110 /* ~9 fps */
-#define WAVE_WINDOW          56 /* px of each line lit at once */
-#define WAVE_SPEED_MIN       0.5f /* px per frame */
-#define WAVE_SPEED_STEP      0.2f /* four speed tiers across the lines */
 
 /* Marquee: pause, scroll to the end, pause again, restart. Slow enough to read
  * and to keep the panel's ghosting down. */
@@ -244,10 +225,6 @@ struct App {
     bool scroll_end_hold; /* the last portion has had its pause */
     volatile bool scrolling; /* a line is too wide: the loop must keep redrawing */
 
-    float wave_head[WAVE_COUNT]; /* where each stroke currently is */
-    uint32_t wave_tick;
-    uint32_t idle_since; /* last keypress, for the screensaver's sleep timer */
-    bool slept; /* screensaver let the backlight go out */
 };
 
 /* ---------------- backlight ---------------- */
@@ -273,28 +250,6 @@ static void backlight_hold(App* app, bool on) {
         app->notif,
         on ? &sequence_display_backlight_enforce_on : &sequence_display_backlight_enforce_auto);
     app->held = on;
-}
-
-/* ---- screensaver sleep ----
- *
- * The "Stay on" setting takes a backlight hold, and a hold beats a plain
- * "backlight off" message - so sleeping the screen means dropping the hold first
- * and re-taking it on wake.
- */
-static void screen_sleep(App* app) {
-    if(app->slept || !app->notif) return;
-    app->slept = true;
-    backlight_hold(app, false);
-    notification_message(app->notif, &sequence_display_backlight_off);
-}
-
-static void screen_wake(App* app) {
-    app->idle_since = furi_get_tick();
-    if(!app->slept) return;
-    app->slept = false;
-    backlight_hold(app, app->cfg.keep_on);
-    if(app->notif) notification_message(app->notif, &sequence_display_backlight_on);
-    if(app->vp) view_port_update(app->vp);
 }
 
 /* ---------------- settings storage ---------------- */
@@ -498,10 +453,6 @@ static void up_down_key(App* app, InputKey key, InputType type) {
 static void input_callback(InputEvent* event, void* context) {
     App* app = context;
 
-    bool was_asleep = app->slept;
-    screen_wake(app); /* any key wakes the screen... */
-    if(was_asleep) return; /* ...and is swallowed, so it cannot act blind */
-
     if(event->key == InputKeyBack && event->type == InputTypeLong) {
         app->running = false; /* hold Back always leaves the app */
         return;
@@ -659,26 +610,24 @@ static void draw_settings(Canvas* canvas, App* app) {
     canvas_draw_str(canvas, 2, 63, "Back: close   Hold: exit");
 }
 
+/* Shown until there is something to show: no PC connected yet, or connected but
+ * no track reported. It says what to do next - this used to be an animation of
+ * flowing lines, which looked good and told the user nothing about why the
+ * Flipper was sitting there. BLE advertises the whole time either way. */
 static void draw_waiting(Canvas* canvas, App* app) {
     bool connected = (app->bt_status == BtStatusConnected);
 
     canvas_set_font(canvas, FontPrimary);
     canvas_draw_str_aligned(canvas, 64, 22, AlignCenter, AlignBottom, "YT Music Remote");
     canvas_set_font(canvas, FontSecondary);
-    canvas_draw_str_aligned(
-        canvas,
-        64,
-        38,
-        AlignCenter,
-        AlignBottom,
-        connected ? "Waiting for PC data..." : "Connect from ytm_bridge");
-    canvas_draw_str_aligned(
-        canvas,
-        64,
-        54,
-        AlignCenter,
-        AlignBottom,
-        connected ? "BT: connected" : "BT: advertising");
+    if(connected) {
+        canvas_draw_str_aligned(canvas, 64, 38, AlignCenter, AlignBottom, "Waiting for PC data...");
+        canvas_draw_str_aligned(canvas, 64, 50, AlignCenter, AlignBottom, "BT: connected");
+        return;
+    }
+    canvas_draw_str_aligned(canvas, 64, 36, AlignCenter, AlignBottom, "Waiting for the PC");
+    canvas_draw_str_aligned(canvas, 64, 46, AlignCenter, AlignBottom, "Start ytm_bridge.py,");
+    canvas_draw_str_aligned(canvas, 64, 56, AlignCenter, AlignBottom, "or the browser add-on");
 }
 
 /* A filled heart, 8x6, XBM order (LSB first, symmetric so either way reads the
@@ -865,42 +814,6 @@ static void draw_volume_overlay(Canvas* canvas, App* app) {
     canvas_set_color(canvas, ColorBlack);
 }
 
-/* Height of one line at x. Fixed low-frequency sines: long lazy curves, no two
- * alike - four amplitudes crossed with three whole wavelengths. The wavelengths
- * divide the screen exactly, so a stroke can run off one edge and carry straight
- * on from the other instead of vanishing at the edge. */
-static int wave_y(uint8_t wave, int x) {
-    float amplitude = 7.0f + (float)(wave % 4) * 5.0f;
-    float cycles = 1.0f + (float)(wave / 4);
-    float frequency = 6.2831853f * cycles / 128.0f;
-    return 32 + (int)(amplitude * sinf(frequency * (float)x + (float)wave * 0.55f));
-}
-
-/* Px per frame for one stroke: four speed tiers, so the lines never move in
- * lockstep. Constant speed, deliberately not a sine - a sinusoidal position
- * stalls at the ends of its swing and the line looks frozen. */
-static float wave_speed(uint8_t wave) {
-    return WAVE_SPEED_MIN + (float)(wave % 4) * WAVE_SPEED_STEP;
-}
-
-/* Idle screen: lines being stroked along, advanced by the app loop.
- *
- * Only WAVE_WINDOW pixels of each line are lit and they slide along it: that is
- * what reads as a line being drawn, and it keeps each frame nearly free, so the
- * panel does not ghost. A dotted tail would look better still but re-lights ~30
- * px per line per frame - the dots have to blink on and off as they travel. */
-static void draw_screensaver(Canvas* canvas, App* app) {
-    for(uint8_t wave = 0; wave < WAVE_COUNT; wave++) {
-        int head = (int)app->wave_head[wave];
-
-        for(int i = 0; i < WAVE_WINDOW; i++) {
-            int x = head - i;
-            if(x < 0) x += 128; /* wraps around: the stroke stays continuous */
-            canvas_draw_dot(canvas, x, wave_y(wave, x));
-        }
-    }
-}
-
 static void draw_callback(Canvas* canvas, void* context) {
     App* app = context;
     furi_mutex_acquire(app->mutex, FuriWaitForever);
@@ -911,7 +824,7 @@ static void draw_callback(Canvas* canvas, void* context) {
     } else if(app->settings_open) {
         draw_settings(canvas, app);
     } else if(app->bt_status != BtStatusConnected) {
-        draw_screensaver(canvas, app);
+        draw_waiting(canvas, app);
     } else {
         draw_now_playing(canvas, app);
         if((int32_t)(app->vol_until - furi_get_tick()) > 0) {
@@ -1187,12 +1100,7 @@ int32_t ytm_remote_app(void* p) {
     app->liked = 2; /* unknown until the PC says otherwise */
     app->mutex = furi_mutex_alloc(FuriMutexTypeNormal);
     app->running = true;
-    app->idle_since = furi_get_tick();
     app->scroll_next = furi_get_tick() + SCROLL_HOLD_MS; /* read before it moves */
-    /* start the strokes spread across the screen rather than stacked on the left */
-    for(uint8_t w = 0; w < WAVE_COUNT; w++) {
-        app->wave_head[w] = (float)(w * 127 / WAVE_COUNT);
-    }
 
     cfg_load(app);
 
@@ -1235,24 +1143,10 @@ int32_t ytm_remote_app(void* p) {
             FURI_LOG_W(TAG, "rx overrun: parser resynced");
         }
 
-        /* Nothing paired: run the idle screensaver, and let the screen go dark
-         * after a while. The BLE profile keeps advertising throughout, so the PC
-         * can still connect - the app is meant to sit here for days. */
-        if(app->bt_status != BtStatusConnected) {
-            uint32_t now = furi_get_tick();
-            if(!app->slept) {
-                if(now - app->wave_tick >= WAVE_FRAME_MS) {
-                    app->wave_tick = now;
-                    for(uint8_t w = 0; w < WAVE_COUNT; w++) {
-                        app->wave_head[w] += wave_speed(w);
-                        if(app->wave_head[w] >= 128.0f) app->wave_head[w] -= 128.0f;
-                    }
-                    view_port_update(app->vp);
-                }
-                if(now - app->idle_since >= SCREENSAVER_SLEEP_MS) screen_sleep(app);
-            }
-        } else {
-            if(app->slept) screen_wake(app); /* the PC turned up: light the screen */
+        /* Nothing to animate while no PC is connected: that screen is a static
+         * "waiting" message now. The BLE profile keeps advertising throughout,
+         * so the PC can still connect - the app is meant to sit here for days. */
+        if(app->bt_status == BtStatusConnected) {
             /* Marquee: step to the end, pause on the last portion, then start
              * over - pausing at the start as well, so a new title can be read
              * before it moves. */
