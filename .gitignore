@@ -7,3 +7,4 @@ windows-support.patch
 .buildenv/
 
 extension/dist/
+web-ext-artifacts/
