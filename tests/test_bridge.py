@@ -409,6 +409,43 @@ class TransportRetryTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
 
 
+class PlayerRefollowTests(unittest.TestCase):
+    """After a browser restart the bridge has to follow the new player name."""
+
+    def backend(self, player, players, touched=0.0):
+        backend = y.MprisBackend(player)
+        scans = []
+
+        def fake_list():
+            scans.append(1)
+            return list(players)
+
+        backend.list = fake_list
+        backend._refollow_at = touched
+        return backend, scans
+
+    def test_it_follows_the_new_firefox_after_a_restart(self):
+        # Firefox registers a new MPRIS name on every start. Asking the old name
+        # forever is what left the Flipper on "waiting for PC data" until the
+        # bridge was restarted by hand.
+        backend, _ = self.backend("firefox.instance_1_2131",
+                                  ["spotify", "firefox.instance_1_999999"])
+        backend._refollow()
+        self.assertEqual(backend.player, "firefox.instance_1_999999")
+
+    def test_a_living_player_is_left_alone(self):
+        backend, _ = self.backend("firefox.instance_1_2131",
+                                  ["firefox.instance_1_2131", "spotify"])
+        backend._refollow()
+        self.assertEqual(backend.player, "firefox.instance_1_2131")
+
+    def test_it_does_not_rescan_on_every_poll(self):
+        backend, scans = self.backend("a", ["b"], touched=time.monotonic())
+        backend._refollow()
+        self.assertEqual(scans, [])
+        self.assertEqual(backend.player, "a")
+
+
 class FirefoxDebugWiringTests(unittest.TestCase):
     """The Linux backend must be given Firefox's debug port.
 

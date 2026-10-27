@@ -83,6 +83,7 @@ ART_SETTLE_S = 4.0     # Windows: how long a new track's cover is still being pu
 ART_RETRY_S = 0.4      # Windows: cover re-read interval while a track settles
 ART_RECHECK_S = 5.0    # Windows: cover re-read interval once settled, if still missing
 LIKE_REFRESH_S = 1.0   # how often the like button is re-read (one localhost round trip)
+REFOLLOW_S = 5.0       # how often to check that our media player still exists
 LIKE_PORT = 9222       # Firefox --remote-debugging-port default
 EXTENSION_PORT = 8765  # localhost port the browser extension posts the like state to
 
@@ -796,6 +797,7 @@ class MprisBackend:
         self._liked = None
         self._liked_at = 0.0
         self._liked_task = None
+        self._refollow_at = 0.0
 
     # ---- helpers shared with the old module-level API
     def run_playerctl(self, *args):
@@ -822,6 +824,32 @@ class MprisBackend:
         if self.link is not None:
             self.link.close()
 
+    def _refollow(self):
+        """Follow the player that replaced ours, when ours has gone.
+
+        Firefox registers a new MPRIS name every time it starts
+        (firefox.instance_1_<pid>). A bridge that started before a browser
+        restart then spends the rest of its life asking about a name that no
+        longer exists: every read fails, nothing is pushed, and the Flipper sits
+        on "waiting for PC data" until someone restarts the bridge by hand -
+        which is exactly what happened here. Checked rarely: it costs a
+        subprocess.
+        """
+        now = time.monotonic()
+        if now - self._refollow_at < REFOLLOW_S:
+            return
+        self._refollow_at = now
+        players = self.list()
+        previous = self.player or ""
+        if not players or (previous and previous in players):
+            return
+        # Prefer the same app as before (Firefox, if that is what we followed),
+        # so a stray second player does not steal the follow.
+        app = previous.split(".instance")[0]
+        same_app = [p for p in players if app and p.startswith(app)]
+        self.player = (same_app or players)[0]
+        print(f"  .. player {previous!r} went away; following {self.player!r}")
+
     async def read(self):
         """Return dict(title, artist, art, playing, pos, dur, url, vol) or None.
 
@@ -829,6 +857,7 @@ class MprisBackend:
         milliseconds and this is the poll itself (see Bridge.run). The playerctl
         calls triggered by device events go through an executor instead.
         """
+        self._refollow()
         fields = (
             "status",
             "position",
