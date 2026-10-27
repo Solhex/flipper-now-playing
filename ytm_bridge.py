@@ -783,9 +783,19 @@ class MprisBackend:
     name = "mpris"
     seek_step = SEEK_STEP
 
-    def __init__(self, player=None, link=None):
+    def __init__(self, player=None, link=None, firefox_port=None):
         self.player = player
         self.link = link
+        # Firefox started with --remote-debugging-port can be asked the like
+        # state and made to click the button itself. The Windows backend has had
+        # this all along; Linux was left without it, so on Linux there was no
+        # way to know a track was liked (no heart) and a like had to be typed at
+        # a focused window instead of clicked in the page.
+        self._debug = FirefoxDebug(firefox_port) if firefox_port else None
+        self._title = ""
+        self._liked = None
+        self._liked_at = 0.0
+        self._liked_task = None
 
     # ---- helpers shared with the old module-level API
     def run_playerctl(self, *args):
@@ -807,6 +817,8 @@ class MprisBackend:
         return [p for p in out.stdout.splitlines() if p.strip()]
 
     def close(self):
+        if self._debug is not None:
+            self._debug.end()
         if self.link is not None:
             self.link.close()
 
@@ -857,10 +869,40 @@ class MprisBackend:
             "url": (f["xesam:url"] or "").strip(),
             "vol": pct(f["volume"]),
             "app": self.player or "",
-            # MPRIS carries no like state: the browser extension or the Firefox
-            # debug port is what knows it.
-            "liked": self.link.liked if (self.link and self.link.fresh()) else None,
+            # MPRIS carries no like state: the browser extension, or Firefox's
+            # debug port, is what knows it. The debug read happens in a worker
+            # (see _liked_state) so this poll never waits on a socket.
+            "liked": (self.link.liked if (self.link and self.link.fresh())
+                      else await self._liked_state(f["xesam:title"] or "")),
         }
+
+    async def _liked_state(self, title):
+        """True / False / None, refreshed in a worker thread.
+
+        The BiDi round trip blocks on a socket, so it runs off the event loop and
+        read() returns the last answer; at 20 Hz a blocking call here would stall
+        the metadata stream. Same shape as the Windows backend's, for the same
+        reason.
+        """
+        self._title = title
+        if self._debug is None:
+            return None
+        now = time.monotonic()
+        if self._liked_task is None and now - self._liked_at >= LIKE_REFRESH_S:
+            self._liked_at = now
+            task = asyncio.ensure_future(
+                asyncio.get_running_loop().run_in_executor(
+                    None, self._debug.like_state, title))
+            self._liked_task = task
+            task.add_done_callback(self._liked_done)
+        return self._liked
+
+    def _liked_done(self, task):
+        self._liked_task = None
+        try:
+            self._liked = task.result()
+        except Exception:
+            self._liked = None
 
     async def command(self, ch):
         args = CMD_TRANSPORT.get(ch)
@@ -897,6 +939,15 @@ class MprisBackend:
         that is what gets checked: firing the keystroke blind would type a '+'
         into whatever else happened to have focus.
         """
+        if self._debug is not None:
+            # A click through Firefox's own protocol needs no focus at all, and
+            # it can report what the click did - so it is tried before either of
+            # the two routes that cannot.
+            state = self._debug.toggle(self._title or "")
+            if state is not None:
+                self._liked, self._liked_at = state, 0.0
+                return True, ("Liked" if state else "Unliked"), state
+
         state = link_toggle(self.link)
         if state is not None:
             return True, ("Liked" if state else "Unliked"), state
@@ -2651,7 +2702,7 @@ async def main_async(args):
             for row in rows:
                 print(row)
             return 0
-        mpris = MprisBackend(args.player, link)
+        mpris = MprisBackend(args.player, link, firefox_port)
         for player in mpris.list():
             print(player)
         return 0
@@ -2669,7 +2720,7 @@ async def main_async(args):
     else:
         player = args.player
         if not player:
-            mpris = MprisBackend(None, link)
+            mpris = MprisBackend(None, link, firefox_port)
             players = mpris.list()
             waited = getattr(args, "wait_for_player", False)
             while not players and waited:
@@ -2680,7 +2731,7 @@ async def main_async(args):
                 sys.exit("No MPRIS players found - start YouTube Music / a video first.")
             player = players[0]
             print("Using player:", player)
-        backend = MprisBackend(player, link)
+        backend = MprisBackend(player, link, firefox_port)
 
     if args.cmd:
         if args.cmd not in ("p", "n", "b", "-", "+", "u", "d", "l"):

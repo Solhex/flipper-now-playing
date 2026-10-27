@@ -409,6 +409,24 @@ class TransportRetryTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
 
 
+class FirefoxDebugWiringTests(unittest.TestCase):
+    """The Linux backend must be given Firefox's debug port.
+
+    It never was: the flag existed and was parsed, but only the Windows backend
+    was handed it. So on Linux the like state could not be read at all - no
+    heart - and a like had to be typed at a focused window, which is what pulled
+    YouTube Music to the front on every press.
+    """
+
+    def test_a_port_gives_the_linux_backend_a_debug_reader(self):
+        backend = y.MprisBackend("firefox", None, firefox_port=9222)
+        self.assertIsInstance(backend._debug, y.FirefoxDebug)
+        self.assertEqual(backend._debug.port, 9222)
+
+    def test_no_port_means_no_debug_reader(self):
+        self.assertIsNone(y.MprisBackend("firefox", None)._debug)
+
+
 class DeviceTextTests(unittest.TestCase):
     """Titles the Flipper cannot draw are converted on the way out, not left blank.
 
