@@ -21,7 +21,13 @@ jobs:
             sdk-channel: dev
           - name: release channel
             sdk-channel: release
-          # You can add unofficial channels here. See ufbt action docs for more info.
+          # Momentum, because that is the firmware the README assumes on the
+          # device. An official-SDK build is API 88.x and a Momentum Flipper
+          # (API 87.1) refuses it as "too new", so this is the artifact most
+          # people should actually download. Index URL from `ufbt status`.
+          - name: momentum
+            sdk-index-url: https://up.momentum-fw.dev/firmware/directory.json
+            sdk-channel: release
     name: 'ufbt: Build for ${{ matrix.name }}'
     steps:
       - name: Checkout
@@ -31,6 +37,8 @@ jobs:
         id: build-app
         with:
           sdk-channel: ${{ matrix.sdk-channel }}
+          # Empty for the official entries, and the action skips it then.
+          sdk-index-url: ${{ matrix.sdk-index-url }}
       - name: Upload app artifacts
         uses: actions/upload-artifact@v4
         with:

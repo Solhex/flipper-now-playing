@@ -70,6 +70,32 @@ Needs `bleak` + `pillow` (`pip install -r requirements.txt`), and `playerctl` on
 Linux. On the Flipper: open **YT Music Remote** (Apps -> Bluetooth) with
 Bluetooth ON.
 
+### The Firefox add-on (worth it: the heart + a real like)
+
+Firefox refuses to keep an unsigned add-on, so there are two routes and neither
+is a couple of clicks:
+
+```
+1. Temporary - works immediately, gone after a Firefox restart:
+
+     python3 extension/build.py          # -> extension/dist/firefox/
+
+   then  about:debugging#/runtime/this-firefox  ->  Load Temporary Add-on  ->
+   pick  extension/dist/firefox/manifest.json
+
+2. Permanent - sign it with your own Mozilla API keys
+   (https://addons.mozilla.org/developers/addon/api/key/):
+
+     npx web-ext sign --source-dir extension/dist/firefox \
+         --api-key "$AMO_JWT_ISSUER" --api-secret "$AMO_JWT_SECRET" --channel unlisted
+
+   then install the signed .xpi it produces. It is not on AMO, so this is a
+   per-user step, not a link.
+```
+
+Skip both and the bridge still runs - you lose the heart and a like becomes a
+blind keystroke, as the browser table below spells out.
+
 **Start it at login.** Both platforms have an installer that sets the autostart
 up and starts it now, so this is the only step after `pip install`:
 
