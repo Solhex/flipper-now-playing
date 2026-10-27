@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Flipper YT Music Remote",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "Show YouTube Music's now-playing on a Flipper Zero and control playback - no companion app to install.",
   "homepage_url": "https://github.com/Solhex/flipper-now-playing",
   "author": "Solhex",
