@@ -104,7 +104,7 @@ loader refuses it ("too new"). Momentum's SDK is what's used above.
 | OK | play / pause |
 | **OK (hold)** | like / unlike |
 | Up / Down | tap: volume ±5 % · hold (~0.3 s): next / previous track |
-| Left / Right | seek ∓10 s |
+| Left / Right | seek ∓5 s (what YouTube Music's own seek controls do) |
 | Back (short) | settings menu (backlight, stay-on, key list, exit) |
 | Back (hold) | exit the app |
 

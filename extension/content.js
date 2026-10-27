@@ -226,8 +226,10 @@
        * synthetic click (see fireLike). Kept because there is no alternative. */
       case "next": { const n = document.querySelector(NEXT_BTN); if (n) press(n); break; }
       case "prev": { const p = document.querySelector(PREV_BTN); if (p) press(p); break; }
-      case "seekback": if (v && isFinite(v.currentTime)) v.currentTime = Math.max(0, v.currentTime - 10); break;
-      case "seekfwd": if (v && isFinite(v.duration)) v.currentTime = Math.min(v.duration, v.currentTime + 10); break;
+      /* 5 s: what YouTube Music's own seek controls do, so the buttons on the
+       * device and the buttons in the player agree. */
+      case "seekback": if (v && isFinite(v.currentTime)) v.currentTime = Math.max(0, v.currentTime - 5); break;
+      case "seekfwd": if (v && isFinite(v.duration)) v.currentTime = Math.min(v.duration, v.currentTime + 5); break;
       case "volup": if (v) v.volume = Math.min(1, v.volume + 0.05); break;
       case "voldown": if (v) v.volume = Math.max(0, v.volume - 0.05); break;
       default: break;

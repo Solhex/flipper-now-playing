@@ -54,11 +54,16 @@ IS_WINDOWS = sys.platform == "win32"
 # ---- tunables ----
 ART_SIZE = 44          # px, square; the largest cover that still leaves a row
                        # between it and the bar (64 rows: cover 44 + bar 7 + time 8)
-# Seconds per seek tap, the same everywhere. Firefox offers no seek API, only
-# YouTube Music's own shortcuts (l/h = 10 s), so 10 s is the one step every
-# platform can actually honour — a device that promises 5 s and jumps 10 would be
-# lying on Windows.
-SEEK_STEP = 10
+# Seconds per seek tap. YouTube Music's own seek controls — the ⟲/⟳ buttons and
+# the arrow keys — step 5 s, and that is what the device should match, so the
+# paths that can choose an amount (MPRIS on Linux, SMTC on Windows, the browser
+# extension) all move exactly this.
+SEEK_STEP = 5
+# The one path that cannot choose: Firefox on Windows has no seek API, so the
+# bridge types YouTube Music's own shortcut at the tab. h/l are the shortcuts
+# that work without the seek bar having focus, and they step 10 s. Named here so
+# the log tells the truth instead of implying the key obeys SEEK_STEP.
+FIREFOX_SEEK_STEP = 10
 VOLUME_STEP = 0.05     # fraction of full scale per volume key press
 POLL_HZ = 20           # metadata pushes per second (override with --hz)
 POLL_HZ_MAX = 25
@@ -1642,7 +1647,7 @@ if IS_WINDOWS:
                 print(f"  !! command {ch!r} failed: {exc}")
 
         async def seek(self, direction):
-            """±seek_step. Firefox has no SMTC seek, so it types l/h at the tab."""
+            """±SEEK_STEP, except on Firefox where the h/l shortcut decides."""
             session = self.session
             if session is None:
                 return
@@ -1654,7 +1659,7 @@ if IS_WINDOWS:
                     return
                 key = VK_L if direction > 0 else VK_H
                 if self._type_at(row, [key]):
-                    print(f"  <- seek {'+' if direction > 0 else '-'}{self.seek_step}s "
+                    print(f"  <- seek {'+' if direction > 0 else '-'}{FIREFOX_SEEK_STEP}s "
                           f"-> Firefox shortcut {'l' if direction > 0 else 'h'}")
                 return
 
