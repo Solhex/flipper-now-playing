@@ -554,7 +554,44 @@ class SinkInputParseTests(unittest.TestCase):
 
     def test_streams_come_out_with_their_levels(self):
         self.assertEqual(y.parse_streams(self.SAMPLE),
-                         [(414, "Firefox", 100, False), (976, "vesktop", 50, False)])
+                         [(414, "Firefox", 100, False, None),
+                          (976, "vesktop", 50, False, None)])
+
+    # Measured here: one Firefox, two tabs making sound - YouTube Music at 35%
+    # and a YouTube video at 60% on the newer stream (#11420 > #11185).
+    TWO_TABS = (
+        "Sink Input #11185\n"
+        "\tVolume: front-left: 22902 /  35% / -27.40 dB\n"
+        "\t\tapplication.name = \"Firefox\"\n"
+        "\t\tmedia.name = \"Citizen Kane | YouTube Music\"\n"
+        "\n"
+        "Sink Input #11420\n"
+        "\tVolume: front-left: 39274 /  60% / -13.34 dB\n"
+        "\t\tapplication.name = \"Firefox\"\n"
+        "\t\tmedia.name = \"(260) TikTok Chef Calls Out Lawyers Porsche - YouTube\"\n"
+    )
+
+    def test_a_youtube_tab_is_never_the_tab_that_gets_moved(self):
+        # The volume key used to follow the newest stream, so watching a plain
+        # YouTube video moved that video's volume instead of the music's.
+        backend = y.MprisBackend("firefox.instance_1_44")
+        original = y.pactl_streams
+        y.pactl_streams = lambda: y.parse_streams(self.TWO_TABS)
+        try:
+            self.assertEqual(backend.stream(force=True), (11185, 35))
+        finally:
+            y.pactl_streams = original
+
+    def test_without_a_music_stream_the_other_stream_still_answers(self):
+        # No YouTube Music stream at all: nothing else has a claim, so the old
+        # app-wide choice stands.
+        backend = y.MprisBackend("firefox.instance_1_44")
+        original = y.pactl_streams
+        y.pactl_streams = lambda: y.parse_streams(self.TWO_TABS.split("\n\n")[1])
+        try:
+            self.assertEqual(backend.stream(force=True), (11420, 60))
+        finally:
+            y.pactl_streams = original
 
     def test_junk_gives_no_streams(self):
         self.assertEqual(y.parse_streams("no sink inputs here\n"), [])

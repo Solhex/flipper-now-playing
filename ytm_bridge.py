@@ -742,24 +742,27 @@ def link_toggle(link, title="", timeout=2.5, attempts=2, client=None):
 
 
 def parse_streams(text):
-    """[(index, application name, percent, corked)] from pactl list sink-inputs.
+    """[(index, application name, percent, corked, media name)] from pactl.
 
     The mixer is the layer that decides how loud the music actually is, and one
     application can own more than one stream: a browser leaves a corked stream
     behind after a track change, and moving that one changes a number and nothing
-    else. `corked` is how the mixer says which streams are silent.
+    else. `corked` is how the mixer says which streams are silent. The media name
+    is the tab's title, which is what a browser's streams are told apart by.
     """
     streams = []
-    index = app = percent = None
+    index = app = percent = media = None
     corked = False
     for line in text.splitlines():
         line = line.strip()
         if line.startswith("Sink Input #"):
             if index is not None and app and percent is not None:
-                streams.append((index, app, percent, corked))
-            index, app, percent, corked = int(line.split("#", 1)[1]), None, None, False
+                streams.append((index, app, percent, corked, media))
+            index, app, percent, corked, media = int(line.split("#", 1)[1]), None, None, False, None
         elif line.startswith("application.name = "):
             app = line.split("=", 1)[1].strip().strip('"')
+        elif line.startswith("media.name = "):
+            media = line.split("=", 1)[1].strip().strip('"')
         elif line.startswith("Corked:"):
             corked = line.split(":", 1)[1].strip().lower() == "yes"
         elif line.startswith("Volume:") and percent is None:
@@ -770,8 +773,14 @@ def parse_streams(text):
                 except ValueError:
                     percent = None
     if index is not None and app and percent is not None:
-        streams.append((index, app, percent, corked))
+        streams.append((index, app, percent, corked, media))
     return streams
+
+
+# Firefox titles a YouTube Music tab "<track> | YouTube Music" and puts that in
+# the stream's media name, so this suffix is the only thing that separates the
+# music tab from a plain YouTube tab in the same browser.
+YTM_MEDIA = "| youtube music"
 
 
 def pactl_streams():
@@ -1232,6 +1241,10 @@ class MprisBackend:
           corked one instead put 95% on the screen for a second every time the
           song changed. So when only silence is left, say so (None) rather than
           answer with a stale stream; the newest index is the current one.
+        - A browser is one application with one stream per tab that makes sound,
+          so YouTube Music and a plain YouTube tab look alike here. Picking by
+          index alone moved whatever video was on screen, so a stream naming
+          YouTube Music is the one that counts whenever there is one.
 
         Cached for a moment: the poll runs at 20 Hz and this shells out to pactl.
         """
@@ -1240,6 +1253,11 @@ class MprisBackend:
             return index, percent
         app = (self.player or "").split(".instance")[0].lower()
         matches = [s for s in pactl_streams() if app and app in s[1].lower()]
+        music = [s for s in matches if (s[4] or "").lower().endswith(YTM_MEDIA)]
+        # shortcut: only Firefox names a stream after its tab, so a browser that
+        # does not falls through to the app-wide choice - upgrade if Chromium
+        # tabs ever need this and its streams carry no title.
+        matches = music or matches
         if running_only:
             matches = [s for s in matches if not s[3]]
         chosen = max(matches, key=lambda s: s[0]) if matches else None
