@@ -21,8 +21,10 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 DIST = HERE / "dist"
 # remote.html/remote.js are the Web Bluetooth link page: a document is the only
-# context that can hold the GATT connection, so it ships with every target.
+# context that can hold the GATT connection, so it ships with every target —
+# except Firefox, which has no Web Bluetooth and cannot use any of it.
 SHARED = ("content.js", "background.js", "remote.html", "remote.js")
+WEB_BLUETOOTH_ONLY = ("remote.html", "remote.js")
 ICONS = "icons"
 
 
@@ -32,9 +34,12 @@ def build_manifest(base, target):
     if target == "firefox":
         manifest["background"] = {"scripts": ["background.js"]}
         # Firefox has no Web Bluetooth: the permission would only produce an
-        # "unknown permission" warning, and the loopback bridge is the path there.
+        # "unknown permission" warning, the Web Bluetooth link page could never
+        # work, and a toolbar button opening it would only say so. Ship none of
+        # the three; the loopback bridge is the path there.
         manifest["permissions"] = [p for p in manifest.get("permissions", [])
                                    if p != "bluetooth"]
+        manifest.pop("action", None)
         manifest.setdefault("browser_specific_settings", {}).setdefault(
             "gecko", {}).update({
                 "id": "ytm-bridge@solhex.local",
@@ -64,6 +69,8 @@ def package(target):
                                           encoding="utf-8")
 
     for name in SHARED:
+        if target == "firefox" and name in WEB_BLUETOOTH_ONLY:
+            continue
         shutil.copy(HERE / name, folder / name)
     shutil.copytree(HERE / ICONS, folder / ICONS)
 

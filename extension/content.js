@@ -156,25 +156,10 @@
     const y = Math.round(box.top + box.height / 2);
     const at = document.elementFromPoint(x, y) || el;
     const covered = !(at === el || el.contains(at));
-    const opts = { bubbles: true, cancelable: true, composed: true, view: window,
-                   clientX: x, clientY: y, button: 0, buttons: 1, pointerId: 1,
-                   pointerType: "mouse", isPrimary: true };
-    const sequence = [
-      ["pointerdown", PointerEvent], ["mousedown", MouseEvent],
-      ["pointerup", PointerEvent], ["mouseup", MouseEvent],
-      ["click", MouseEvent],
-    ];
     /* Exactly one click per target: dispatching the sequence and then calling
      * .click() as well fires it twice, which toggles the like straight back. */
     for (const target of covered && at !== el ? [at, el] : [el]) {
-      for (const [type, Kind] of sequence) {
-        const eventOpts = type === "click"
-          ? { ...opts, buttons: 0 }
-          : opts;
-        try {
-          target.dispatchEvent(new Kind(type, eventOpts));
-        } catch (e) { /* ignore: a site-specific element may reject an event */ }
-      }
+      press(target, { x, y });
     }
     return {
       tag: at.tagName ? `${at.tagName.toLowerCase()}${at.id ? "#" + at.id : ""}` : "?",
@@ -199,10 +184,12 @@
   const NEXT_BTN = "#next-button, .next-button";
   const PREV_BTN = "#previous-button, .previous-button";
 
-  function press(el) {
+  /* One copy of the pointer sequence. `at` lets the like path aim at the point
+   * it already measured (and at whatever is covering the button). */
+  function press(el, at) {
     const box = el.getBoundingClientRect();
-    const x = Math.round(box.left + box.width / 2);
-    const y = Math.round(box.top + box.height / 2);
+    const x = at ? at.x : Math.round(box.left + box.width / 2);
+    const y = at ? at.y : Math.round(box.top + box.height / 2);
     const opts = { bubbles: true, cancelable: true, composed: true, view: window,
                    clientX: x, clientY: y, button: 0, buttons: 1, pointerId: 1,
                    pointerType: "mouse", isPrimary: true };
@@ -220,13 +207,25 @@
     const v = videoEl();
     switch (kind) {
       case "playpause": {
+        /* Media element first: the page cannot ignore a programmatic
+         * play()/pause(). Fall back to the button only if play() is refused
+         * (the autoplay rule), which is the case a click exists for. */
+        if (v) {
+          const wantPlay = v.paused;
+          const r = wantPlay ? v.play() : v.pause();
+          if (wantPlay && r && r.catch) {
+            r.catch(() => { const b = document.querySelector(PLAY_PAUSE); if (b) press(b); });
+          }
+          break;
+        }
         const b = document.querySelector(PLAY_PAUSE);
         if (b) press(b);
-        else if (v) (v.paused ? v.play() : v.pause());
         break;
       }
-      case "next": { const b = document.querySelector(NEXT_BTN); if (b) press(b); break; }
-      case "prev": { const b = document.querySelector(PREV_BTN); if (b) press(b); break; }
+      /* No element API for skip, so these are clicks — and a page may ignore a
+       * synthetic click (see fireLike). Kept because there is no alternative. */
+      case "next": { const n = document.querySelector(NEXT_BTN); if (n) press(n); break; }
+      case "prev": { const p = document.querySelector(PREV_BTN); if (p) press(p); break; }
       case "seekback": if (v && isFinite(v.currentTime)) v.currentTime = Math.max(0, v.currentTime - 10); break;
       case "seekfwd": if (v && isFinite(v.duration)) v.currentTime = Math.min(v.duration, v.currentTime + 10); break;
       case "volup": if (v) v.volume = Math.min(1, v.volume + 0.05); break;

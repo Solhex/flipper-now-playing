@@ -369,16 +369,15 @@ class BrowserLink:
             def _reply(self, code, payload=b"{}", timeout=0):
                 self.send_response(code)
                 self.send_header("Content-Type", "application/json")
-                self.send_header("Access-Control-Allow-Origin", "*")
-                self.send_header("Access-Control-Allow-Headers", "Content-Type")
-                # Chrome asks before a public page may reach a private address
-                self.send_header("Access-Control-Allow-Private-Network", "true")
+                # Deliberately no CORS headers. The extension reaches this port
+                # through its host_permissions, so it needs none — and
+                # `Access-Control-Allow-Origin: *` plus the private-network
+                # opt-in is exactly what let ANY site you visit POST /toggle
+                # (a click, and on the fallback path a real Enter at your
+                # focused window) or fake the track on the Flipper.
                 self.send_header("Content-Length", str(len(payload)))
                 self.end_headers()
                 self.wfile.write(payload)
-
-            def do_OPTIONS(self):
-                self._reply(204, b"")
 
             def do_POST(self):
                 length = int(self.headers.get("Content-Length") or 0)

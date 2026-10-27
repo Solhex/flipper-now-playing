@@ -213,7 +213,11 @@ chrome.runtime.onMessage.addListener((message, sender) => {
 /* The toolbar button opens (or focuses) the Flipper link page. Its tab id is
  * kept in storage so no "tabs" permission is needed to find it again, and it is
  * marked non-discardable: Chromium must not throw away the tab that owns the
- * Bluetooth connection. */
+ * Bluetooth connection.
+ *
+ * The Firefox build has no action key at all (the link page cannot work there),
+ * so guard the listener: an undefined namespace at top level would take the
+ * whole worker down with it. */
 const REMOTE_TAB_KEY = "remoteTabId";
 
 async function openRemoteTab() {
@@ -231,7 +235,9 @@ async function openRemoteTab() {
   try { await chrome.tabs.update(tab.id, { autoDiscardable: false }); } catch (error) { /* older browser */ }
 }
 
-chrome.action.onClicked.addListener(openRemoteTab);
+if (chrome.action && chrome.action.onClicked) {
+  chrome.action.onClicked.addListener(openRemoteTab);
+}
 
 chrome.runtime.onStartup.addListener(pollLoop);
 chrome.runtime.onInstalled.addListener(pollLoop);

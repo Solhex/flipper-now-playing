@@ -52,6 +52,14 @@ function onState(p) {
   if (!p.art || p.art !== lastArt) maybeSendArt(p.art);
   maybeSendLike(p.liked === null ? LIKE_UNKNOWN : (p.liked ? LIKE_YES : LIKE_NO));
   if (typeof p.vol === "number" && p.vol !== lastVol) sendVol(p.vol);
+  /* A press the page refused must not look like a dead button. `after` is only
+   * present once the page has checked the result, so a pending ok:false (set
+   * the instant the click is dispatched) does not cry wolf. */
+  const click = p.diag && p.diag.click;
+  if (awaitingLike && click && click.ok === false && "after" in click) {
+    awaitingLike = false;
+    send(toastFrame("Like failed", 2));
+  }
   show(p);
 }
 
@@ -73,8 +81,10 @@ const enc = (s, max) => Array.from(new TextEncoder().encode(s)).slice(0, max);
 function artFrame(w, h, bits) { return frame(FRAME_ART, [w, h, ...bits]); }
 function likeFrame(v) { return frame(FRAME_LIKE, [v]); }
 function volFrame(v) { return frame(FRAME_VOL, [v]); }
-/* One short line the device shows for a moment: icon 1 = heart, 2 = broken. */
-function toastFrame(text, icon) { return frame(FRAME_TOAST, [icon, ...enc(text, 22)]); }
+/* One short line the device shows for a moment: icon 1 = heart, 2 = broken.
+ * 23 text bytes, not 22: the Python host sends TOAST_MAX-1 and the two hosts
+ * must agree byte for byte (tests/test_frames_js.py enforces it). */
+function toastFrame(text, icon) { return frame(FRAME_TOAST, [icon, ...enc(text, 23)]); }
 
 /* ------------------------------------------------------------------ BLE TX */
 async function send(bytes) {
@@ -104,7 +114,7 @@ function sendVol(v) { lastVol = v; send(volFrame(v)); }
 
 /* ------------------------------------------------------------------ artwork */
 async function maybeSendArt(url) {
-  if (!url) return;
+  if (!url || url === lastArt) return;
   lastArt = url;
   try {
     /* Fetch through the extension's host permission: the page's own image is
@@ -113,6 +123,13 @@ async function maybeSendArt(url) {
     const res = await fetch(url, { cache: "force-cache" });
     const blob = await res.blob();
     const bmp = await createImageBitmap(blob);
+    /* Skip two tracks quickly and the slower fetch finishes last: without this
+     * the previous track's cover lands on the device wearing the new track's
+     * name (the Python bridge had the same bug — commit 210fb36). */
+    if (url !== lastArt) {
+      bmp.close && bmp.close();
+      return;
+    }
     const { bits, w, h } = toXbm(bmp, ART_SIZE);
     if (w && h) {
       await send(artFrame(w, h, bits));
@@ -179,13 +196,23 @@ function setStatus(text, ok) {
   $("status").className = ok ? "ok" : "";
 }
 
+/* Registered once per device. Adding this inside connectWith() meant every
+ * reconnect added another handler, so a single drop fired N reconnects at once
+ * — N simultaneous attempts at the one link. */
+let hookedDevice = null;
+
+function onDisconnected() {
+  setStatus("Disconnected — reconnecting…", false);
+  server = rxChar = txChar = null;
+  setTimeout(() => connectWith(device), 3000);
+}
+
 async function connectWith(dev) {
   device = dev;
-  device.addEventListener("gattserverdisconnected", () => {
-    setStatus("Disconnected — reconnecting…", false);
-    server = rxChar = txChar = null;
-    setTimeout(() => connectWith(device), 3000);
-  });
+  if (hookedDevice !== dev) {
+    hookedDevice = dev;
+    dev.addEventListener("gattserverdisconnected", onDisconnected);
+  }
   server = await device.gatt.connect();
   const svc = await server.getPrimaryService(SERIAL_SVC);
   rxChar = await svc.getCharacteristic(RX_UUID);
