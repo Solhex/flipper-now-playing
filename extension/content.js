@@ -1,6 +1,6 @@
 /* Runs in the YouTube Music page: reads the like button and presses it on demand.
  *
- * The like state lives only in the page — no desktop API exposes it — so this is
+ * The like state lives only in the page - no desktop API exposes it - so this is
  * the honest source: the same `aria-pressed` the site's own UI uses, read from
  * the same button a user clicks.
  *
@@ -73,7 +73,7 @@
   /* The cover the player is showing. Media Session metadata names the track's own
    * artwork; the player-bar image is the fallback for the moments before the
    * metadata lands. The host page cannot read the pixels (cross-origin taint),
-   * so only the URL travels — the extension page fetches and downsizes it. */
+   * so only the URL travels - the extension page fetches and downsizes it. */
   const artworkUrl = () => {
     const meta = navigator.mediaSession && navigator.mediaSession.metadata;
     const art = meta && meta.artwork;
@@ -86,7 +86,7 @@
     return img ? (img.currentSrc || img.src || "") : "";
   };
 
-  /* Position/length/volume come straight off the media element — better than any
+  /* Position/length/volume come straight off the media element - better than any
    * desktop API, which is why this runs here rather than on the PC. */
   const progress = () => {
     const v = videoEl();
@@ -111,7 +111,7 @@
       visible: document.visibilityState === "visible",
       focused: document.hasFocus(),
       lastActive,
-      /* Proof of what the last click did — "the button is not there" and "the
+      /* Proof of what the last click did - "the button is not there" and "the
        * click changed nothing" are indistinguishable from the bridge otherwise. */
       diag: { button: !!button(), renderers: renderers(), click: lastClick,
               seen, reject: lastReject },
@@ -146,7 +146,7 @@
   window.addEventListener("blur", () => report(true));
 
   /* A plain `.click()` is not enough on the real page: it lands, the button is
-   * there, and aria-pressed never changes (verified on Brave — the untrusted
+   * there, and aria-pressed never changes (verified on Brave - the untrusted
    * click is ignored). So send the whole pointer sequence a person would, at the
    * element actually drawn at the button's centre, and report what was in the way
    * if something else is on top. */
@@ -222,7 +222,7 @@
         if (b) press(b);
         break;
       }
-      /* No element API for skip, so these are clicks — and a page may ignore a
+      /* No element API for skip, so these are clicks - and a page may ignore a
        * synthetic click (see fireLike). Kept because there is no alternative. */
       case "next": { const n = document.querySelector(NEXT_BTN); if (n) press(n); break; }
       case "prev": { const p = document.querySelector(PREV_BTN); if (p) press(p); break; }

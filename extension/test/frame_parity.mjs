@@ -18,7 +18,8 @@ const src = readFileSync(join(here, "..", "remote.js"), "utf8");
 
 const HOOK = `
 globalThis.__ytm = { setState: (s) => { state = s; },
-  frame, metaFrame, artFrame, likeFrame, volFrame, toastFrame, enc };
+  frame, metaFrame, artFrame, likeFrame, volFrame, toastFrame, enc,
+  drawable, hangulToLatin, onState };
 `;
 
 const el = () => ({ addEventListener() {}, textContent: "", className: "" });
@@ -57,5 +58,14 @@ out.meta_truncated = hex(y.metaFrame(true));
  * so both must produce the same (possibly invalid) tail. */
 y.setState({ playing: true, pos: 5, dur: 9, title: "é".repeat(40), artist: "" });
 out.meta_split_char = hex(y.metaFrame(true));
+
+/* The page -> device conversion. Must match device_text() in ytm_bridge.py for
+ * everything both sides can do; the list is duplicated in tests/test_frames_js.py
+ * and compared entry by entry. */
+const DRAWABLE_CASES = [
+  "Tïtle", "naïve café", "알루미늄", "안녕하세요", "Busker, Clown, Dancer",
+  "", "  padded  ", "ＡＢＣ １２３", "عربي", "😀 🎵",
+];
+out.drawable = JSON.stringify(DRAWABLE_CASES.map((s) => y.drawable(s)));
 
 console.log(JSON.stringify(out));

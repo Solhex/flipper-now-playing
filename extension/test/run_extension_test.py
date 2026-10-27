@@ -3,7 +3,7 @@
 This runs its **own** bridge on a free port and points the copied extension at it,
 so it never touches the bridge you are actually using. (An earlier version talked
 to the live one, and with two browsers polling the same bridge the like state
-raced — it toggled the user's real track.)
+raced - it toggled the user's real track.)
 
 The mock page in this folder carries the same like-button DOM as the site.
 

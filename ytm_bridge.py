@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ytm_bridge — PC side of the "YT Music Remote" Flipper Zero app.
+ytm_bridge - PC side of the "YT Music Remote" Flipper Zero app.
 
 Reads what's playing from the desktop media session, pushes
 title/artist/progress/volume/album-art to the Flipper over Bluetooth LE, and
@@ -14,7 +14,7 @@ Windows media session (SMTC, the same source the volume flyout shows) read
 through WinRT. Firefox appears in both, but each platform has its own quirks,
 which is what the per-platform backends below deal with.
 
-Wire format (PC -> Flipper) — [type:1][len:2 LE][payload:len]
+Wire format (PC -> Flipper) - [type:1][len:2 LE][payload:len]
     0x01 META: [state:1][pos:2 LE][dur:2 LE][title utf8]0[artist utf8]0
     0x02 ART : [w:1][h:1][1-bit XBM rows, LSB-first per byte, (w+7)/8 per row]
     0x03 VOL : [volume:1]  0..100
@@ -28,6 +28,7 @@ import atexit
 import asyncio
 import concurrent.futures
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import importlib
 import io
 import json
 import os
@@ -38,6 +39,7 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -54,14 +56,14 @@ IS_WINDOWS = sys.platform == "win32"
 # ---- tunables ----
 ART_SIZE = 44          # px, square; the largest cover that still leaves a row
                        # between it and the bar (64 rows: cover 44 + bar 7 + time 8)
-# Seconds per seek tap. YouTube Music's own seek controls — the ⟲/⟳ buttons and
-# the arrow keys — step 5 s, and that is what the device should match, so every
+# Seconds per seek tap. YouTube Music's own seek controls - the back/forward buttons and
+# the arrow keys - step 5 s, and that is what the device should match, so every
 # path moves exactly this: MPRIS on Linux, SMTC on Windows, the browser
 # extension, and the keystroke path below.
 SEEK_STEP = 5
 # The one path that cannot ask for a distance is Firefox on Windows: it has no
 # seek API, so the bridge types a YouTube Music shortcut at the tab. Its h/l
-# shortcuts step 10 s, but Shift+H / Shift+L step 1 s — so that path taps the
+# shortcuts step 10 s, but Shift+H / Shift+L step 1 s - so that path taps the
 # 1-second shortcut SEEK_STEP times and lands on the same 5 s as everywhere
 # else, from the same constant.
 YT_SEEK_TAP_S = 1
@@ -113,7 +115,7 @@ CMD_LIKE = "l"                    # device -> PC: hold OK, toggle like
 
 
 # CREATE_NO_WINDOW. A GUI-subsystem process (pythonw.exe, which is what the logon
-# shortcut runs) has no console, so spawning a console app — yt-dlp is one — makes
+# shortcut runs) has no console, so spawning a console app - yt-dlp is one - makes
 # Windows allocate a fresh console *window*: a terminal flashes up on every new
 # track, which looks like the app is doing something wrong. Suppress it.
 CREATE_NO_WINDOW = 0x08000000
@@ -376,7 +378,7 @@ class BrowserLink:
                 self.send_response(code)
                 self.send_header("Content-Type", "application/json")
                 # Deliberately no CORS headers. The extension reaches this port
-                # through its host_permissions, so it needs none — and
+                # through its host_permissions, so it needs none - and
                 # `Access-Control-Allow-Origin: *` plus the private-network
                 # opt-in is exactly what let ANY site you visit POST /toggle
                 # (a click, and on the fallback path a real Enter at your
@@ -493,7 +495,7 @@ class BrowserLink:
         try:
             server = Server(("127.0.0.1", self.port), Handler)
         except OSError as exc:
-            # The port is taken — almost always by an already-running bridge. Then
+            # The port is taken - almost always by an already-running bridge. Then
             # this process is a helper (--dump, --cmd) and asks *that* one instead
             # of hosting: the extension can only report to a single owner.
             self.error = str(exc)
@@ -524,7 +526,7 @@ def link_toggle(link, title="", timeout=2.5, attempts=2, client=None):
 
     Waits for the *like state* to move, not for any report: the page heartbeats
     every couple of seconds regardless, and a fresh service worker that has not
-    attached its content script yet swallows the first command outright — the
+    attached its content script yet swallows the first command outright - the
     message simply has nobody to land on. Hence the retry, which costs nothing
     when the first click worked (the state moved, so it returns at once).
 
@@ -775,7 +777,7 @@ class MprisBackend:
         try:
             out = subprocess.run(["playerctl", "-l"], capture_output=True, text=True)
         except FileNotFoundError:
-            sys.exit("playerctl not found — install it to read the media session")
+            sys.exit("playerctl not found - install it to read the media session")
         return [p for p in out.stdout.splitlines() if p.strip()]
 
     def close(self):
@@ -855,7 +857,7 @@ class MprisBackend:
         """Toggle like on the YouTube Music tab. Returns (ok, message).
 
         The like shortcut belongs to the web app, so it can only be typed at a
-        focused window — there is no way to address a browser tab from outside.
+        focused window - there is no way to address a browser tab from outside.
         A window whose *title* shows YouTube Music has it as its active tab, so
         that is what gets checked: firing the keystroke blind would type a '+'
         into whatever else happened to have focus.
@@ -939,7 +941,7 @@ def track_start_age(art_path, max_age=6 * 3600):
     """Seconds since Firefox wrote this track's artwork.
 
     Firefox reports no playback position for YouTube Music, but it writes a
-    fresh art file when a track starts, so that file's mtime dates the track —
+    fresh art file when a track starts, so that file's mtime dates the track -
     which is what lets the bridge join a song already in progress and still show
     the true elapsed time. Returns None when the age is implausible.
     """
@@ -1424,7 +1426,7 @@ if IS_WINDOWS:
                     status = self.Status(session.get_playback_info().playback_status).name
                 except Exception:
                     status = "?"
-                rows.append(f"{self.label(session):<12} {props.title or '?'} — "
+                rows.append(f"{self.label(session):<12} {props.title or '?'} - "
                             f"{props.artist or '?'}  [{status.lower()}]")
             return rows
 
@@ -1462,7 +1464,7 @@ if IS_WINDOWS:
             pos, dur = self._timeline(session, (title, artist), playing)
 
             # Cover art is a byte stream, and reading it is cheap while building
-            # the 1-bit bitmap is not — so the bytes are kept and the frame is
+            # the 1-bit bitmap is not - so the bytes are kept and the frame is
             # only rebuilt when they change (Bridge compares them).
             #
             # The catch is *when* to read them. A browser publishes the track
@@ -1553,8 +1555,8 @@ if IS_WINDOWS:
             published it: the position sits at zero and the total can still be the
             *previous* track's. So a timeline is only believed once its position
             has been seen to move during this track; otherwise the bridge falls
-            back to what it does on Linux — count elapsed time itself and look the
-            length up with yt-dlp — rather than show a wrong number.
+            back to what it does on Linux - count elapsed time itself and look the
+            length up with yt-dlp - rather than show a wrong number.
             """
             try:
                 timeline = session.get_timeline_properties()
@@ -1648,7 +1650,7 @@ if IS_WINDOWS:
                 print(f"  !! command {ch!r} failed: {exc}")
 
         async def seek(self, direction):
-            """±SEEK_STEP on every path, including the keystroke one."""
+            """+/-SEEK_STEP on every path, including the keystroke one."""
             session = self.session
             if session is None:
                 return
@@ -1747,7 +1749,7 @@ if IS_WINDOWS:
             """Toggle like: the button itself when the debug port is open, else keys.
 
             Clicking through BiDi does not need the tab to be on screen, so it
-            works while the bridge is in the background — the keystroke path can
+            works while the bridge is in the background - the keystroke path can
             only type at a focused window.
             """
             state = link_toggle(self.link, self._title, attempts=1)
@@ -1757,7 +1759,7 @@ if IS_WINDOWS:
             first = (self.link.diag() or {}) if self.link is not None else {}
             if not (first.get("click") or {}).get("buttonFocused"):
                 # No verdict from the page yet (a fresh worker has not attached its
-                # content script), so one retry is worth 2.5 s — but not once the
+                # content script), so one retry is worth 2.5 s - but not once the
                 # page has already told us its own click does nothing.
                 state = link_toggle(self.link, self._title, attempts=1)
                 if state is not None:
@@ -1799,7 +1801,7 @@ if IS_WINDOWS:
                 # instead of pointing at a tab that is already open.
                 return False, "Browser did not click", None
             if self.link is not None and self.link.polls > 0:
-                # The worker is polling, so the extension is installed — but no
+                # The worker is polling, so the extension is installed - but no
                 # tab is reporting, which means its content script is not in the
                 # open page (reloading an extension does not re-inject).
                 return False, "Reload the YT Music tab", None
@@ -1840,11 +1842,126 @@ def frame(ftype, payload):
     return bytes([ftype]) + len(payload).to_bytes(2, "little") + payload
 
 
+# --- What the device can actually draw ---------------------------------------
+# The Flipper's fonts are Latin-only bitmap faces (the SDK has FontPrimary,
+# FontSecondary, FontKeyboard and FontBigNumbers, nothing else), and the app
+# draws text byte by byte, so a Korean or Japanese title arrives on screen as blank space.
+# Convert on this side, where a dictionary can live, and keep the raw spelling
+# for everything that is not the display: the cache key, the yt-dlp search and
+# the log all still use the original.
+_HANGUL_INITIAL = ("g", "kk", "n", "d", "tt", "r", "m", "b", "pp", "s", "ss", "",
+                   "j", "jj", "ch", "k", "t", "p", "h")
+_HANGUL_MEDIAL = ("a", "ae", "ya", "yae", "eo", "e", "yeo", "ye", "o", "wa", "wae",
+                  "oe", "yo", "u", "wo", "we", "wi", "yu", "eu", "ui", "i")
+_HANGUL_FINAL = ("", "k", "k", "k", "n", "n", "n", "t", "l", "k", "m", "p", "l", "l",
+                 "p", "l", "m", "p", "p", "t", "t", "ng", "t", "t", "k", "t", "p", "t")
+HANGUL_FIRST, HANGUL_LAST = 0xAC00, 0xD7A3
+KANA_RANGES = ((0x3040, 0x30FF), (0x31F0, 0x31FF), (0xFF66, 0xFF9D))
+HAN_RANGES = ((0x3400, 0x4DBF), (0x4E00, 0x9FFF), (0xF900, 0xFAFF), (0xFF00, 0xFFEF))
+
+
+def _in_ranges(ch, ranges):
+    return any(low <= ord(ch) <= high for low, high in ranges)
+
+
+def hangul_to_latin(text):
+    """Romanise Hangul syllables (simplified Revised Romanization).
+
+    Hangul decomposes mechanically into initial/medial/final, so this needs no
+    dictionary. One assimilation rule is enough for it to read correctly in
+    practice: a final -l doubles into a following -r onset, so the Korean for aluminium comes out as
+    alluminyum rather than alruminyum. Mirrored in extension/remote.js.
+    """
+    out, previous_l = [], False
+    for ch in text:
+        code = ord(ch)
+        if not HANGUL_FIRST <= code <= HANGUL_LAST:
+            out.append(ch)
+            previous_l = False
+            continue
+        offset = code - HANGUL_FIRST
+        initial = _HANGUL_INITIAL[offset // 588]
+        medial = _HANGUL_MEDIAL[(offset % 588) // 28]
+        final = _HANGUL_FINAL[offset % 28]
+        if previous_l and initial == "r":
+            initial = "l"
+        out.append(initial + medial + final)
+        previous_l = final == "l"
+    return "".join(out)
+
+
+_OPTIONAL_MODULES = {}
+
+
+def _optional(module):
+    """Import an optional romanisation dictionary once, or None if absent."""
+    if module not in _OPTIONAL_MODULES:
+        try:
+            _OPTIONAL_MODULES[module] = importlib.import_module(module)
+        except ImportError:
+            _OPTIONAL_MODULES[module] = None
+    return _OPTIONAL_MODULES[module]
+
+
+def _cjk_to_latin(text):
+    """Japanese/Chinese -> Latin, when the optional dictionaries are installed.
+
+    Kana means Japanese (pykakasi); hanzi with no kana means Chinese (pypinyin).
+    Without the dictionary the text is returned unchanged and the caller marks
+    it, which is the whole story on the browser side - the extension cannot
+    bundle megabytes of readings, so it always marks these.
+    """
+    if any(_in_ranges(c, KANA_RANGES) for c in text):
+        kakasi = _optional("pykakasi")
+        if kakasi is None:
+            return text
+        try:
+            return "".join(p.get("hepburn") or p.get("orig", "")
+                           for p in kakasi.kakasi().convert(text))
+        except Exception:
+            return text
+    if any(_in_ranges(c, HAN_RANGES) for c in text):
+        pinyin = _optional("pypinyin")
+        if pinyin is None:
+            return text
+        try:
+            return " ".join(pinyin.lazy_pinyin(text))
+        except Exception:
+            return text
+    return text
+
+
+def device_text(text):
+    """Make a string drawable by the Flipper, whose fonts are Latin-only.
+
+    Folds accents to their base letters, romanises what can be romanised, and
+    replaces whatever is left with '?' so a title never silently renders as
+    blank space. Called on the way to the device only.
+    """
+    if not text:
+        return ""
+    if any(ord(c) > 0x7F for c in text):
+        text = _cjk_to_latin(hangul_to_latin(text))
+        text = unicodedata.normalize("NFKD", text)
+        text = "".join(c for c in text if not unicodedata.combining(c))
+        text = "".join(c if 0x20 <= ord(c) < 0x7F else "?" for c in text)
+    return text.strip()
+
+
+def device_meta(m):
+    """The meta dict as the device sees it: text its fonts can actually draw.
+
+    Everything else keeps the original spelling - the cache key, the yt-dlp
+    search and the log line all read the dict that came in.
+    """
+    return dict(m, title=device_text(m["title"]), artist=device_text(m["artist"]))
+
+
 def meta_frame(m, with_text=True):
     """state/pos/dur, plus title/artist unless the caller says they are unchanged.
 
     A clock-only frame is 8 bytes and fits in one BLE write; carrying the text
-    makes it ~80 bytes, which is three or four writes at MTU 23 — that was most
+    makes it ~80 bytes, which is three or four writes at MTU 23 - that was most
     of the delay between a second ticking and the Flipper showing it.
     """
     payload = (
@@ -1867,7 +1984,7 @@ def toast_frame(text, icon=0):
 
     The first payload byte is an icon id (0 none, 1 heart, 2 broken heart) that
     the device draws before the text, so "Liked" can arrive with a heart beside
-    it — the LCD fonts have no such glyph.
+    it - the LCD fonts have no such glyph.
     """
     body = text.encode("utf-8", "replace")[:TOAST_MAX - 1]
     return frame(FRAME_TOAST, bytes([max(0, min(2, int(icon)))]) + body)
@@ -1889,7 +2006,7 @@ def vol_frame(level):
 
 # ---------------------------------------------------------------- BLE
 async def send_toast_once(name_hint, text):
-    """Connect, send one toast, disconnect — a way to check the toast UI."""
+    """Connect, send one toast, disconnect - a way to check the toast UI."""
     dev = await find_flipper(name_hint)
     if not dev:
         for address in known_addresses(name_hint):
@@ -1904,7 +2021,7 @@ async def send_toast_once(name_hint, text):
         write_char, _ = pick_chars(client)
         if not write_char:
             sys.exit("serial characteristics not found")
-        blob = toast_frame(text)
+        blob = toast_frame(device_text(text))
         await client.write_gatt_char(write_char, blob, response=False)
         print(f"toast sent ({len(blob)} bytes): {text!r}")
         await asyncio.sleep(1.0)
@@ -1914,7 +2031,7 @@ async def pair_flipper(name_hint, address_hint=None):
     """Pair with the Flipper once (Windows needs a bond for the serial profile)."""
     dev = address_hint or (await find_flipper(name_hint)) or load_known_address()
     if not dev:
-        sys.exit("no device found — is the Flipper on and advertising?")
+        sys.exit("no device found - is the Flipper on and advertising?")
     print(f"Pairing with {dev} ...")
     async with BleakClient(dev, timeout=CONNECT_TIMEOUT) as client:
         await client.pair()
@@ -1946,7 +2063,7 @@ def known_addresses(name_hint):
     """Addresses already known for this device.
 
     BlueZ: a peripheral it still believes is connected stops advertising, so an
-    empty scan does not mean the Flipper is gone — connecting straight to the
+    empty scan does not mean the Flipper is gone - connecting straight to the
     known address is what makes an always-on bridge recover on its own.
     Windows keeps that address in a small cache file instead (there is no
     bluetoothctl to ask), which also skips the scan on a busy radio.
@@ -1978,7 +2095,7 @@ def drop_stale_link(address):
     """Clear a link BlueZ still holds after the previous bridge died.
 
     While BlueZ thinks the Flipper is connected it will not advertise, and
-    connecting again just hangs on the dead link — dropping it first is what lets
+    connecting again just hangs on the dead link - dropping it first is what lets
     the bridge recover unattended, which is the whole point of running it as a
     service. Windows' BLE stack owns the link itself and releases it with the
     process, so there is nothing to clear there.
@@ -2246,7 +2363,7 @@ class Bridge:
             # First sight of this track: date it from Firefox's art file (one
             # stat per track, not per poll). Firefox does NOT always rewrite
             # that file, so a file older than the track itself tells us nothing
-            # — better to start at 0 than to seed a wildly wrong position. The
+            # - better to start at 0 than to seed a wildly wrong position. The
             # Windows backend has no art file, so it simply reports no age.
             age = track_start_age(m["art"])
             if age is not None and (not m["dur"] or age <= m["dur"]):
@@ -2266,7 +2383,7 @@ class Bridge:
         """Show a short message on the device (the like outcome, say)."""
         if self.write_char is None:
             return
-        await self.write(toast_frame(text, icon))
+        await self.write(toast_frame(device_text(text), icon))
 
     async def on_notify(self, _char, data: bytearray):
         loop = asyncio.get_event_loop()
@@ -2307,10 +2424,14 @@ class Bridge:
             # text goes out only when it changes: the device keeps the last one,
             # so the per-tick frame stays 8 bytes and lands in a single write
             text = (m["title"], m["artist"])
+            # The device's fonts are Latin-only, and the frame takes its text
+            # through device_meta(), so what leaves here is drawable while the
+            # raw spelling still keys the cache, the yt-dlp lookup and the log.
+            shown = device_meta(m)
             # Until the device advertises that it keeps its own text, repeat it
             # every frame: an older build blanks the title on a text-less one.
             await self.write(meta_frame(
-                m, with_text=(text != self.last_text) or not self.device_caps))
+                shown, with_text=(text != self.last_text) or not self.device_caps))
             self.last_text = text
             self.last_sent = now
             # log on change, plus a heartbeat, so a fast stream stays readable
@@ -2392,7 +2513,7 @@ class Bridge:
                     self.client = client
                     self.write_char, notify_char = pick_chars(client)
                     if not self.write_char or not notify_char:
-                        print("Serial service not found — is the app running and BLE on?")
+                        print("Serial service not found - is the app running and BLE on?")
                         await asyncio.sleep(5)
                         continue
                     self.chunk = await prepare(client)
@@ -2427,7 +2548,7 @@ def is_track_url(url):
     """True when the URL addresses the track itself rather than just the site.
 
     Firefox reports the *tab's* URL, and YouTube Music keeps playing while you
-    browse, so it is often only the home page — looking that up gets
+    browse, so it is often only the home page - looking that up gets
     "Unsupported URL" and the track shows no length.
     """
     return bool(url) and ("/watch?" in url or "youtu.be/" in url)
@@ -2438,7 +2559,7 @@ async def dump_once(bridge, wait=12.0):
     """Print what the bridge sees, and exit. No Flipper needed.
 
     It goes through the real pipeline (clock, yt-dlp length lookup), so this is
-    the same numbers the device would be sent — minus the BLE hop.
+    the same numbers the device would be sent - minus the BLE hop.
     """
     deadline = time.monotonic() + wait
     meta = None
@@ -2450,7 +2571,7 @@ async def dump_once(bridge, wait=12.0):
                 break            # length resolved, nothing left to wait for
         await asyncio.sleep(0.5)
     if not meta:
-        print("No media session found — start playback first.")
+        print("No media session found - start playback first.")
         return 1
 
     print(f"app      : {meta['app'] or '?'}")
@@ -2491,7 +2612,7 @@ async def main_async(args):
             backend = WindowsBackend(args.player, firefox_port, link)
             rows = await backend.list()
             if not rows:
-                print("No media sessions — start playback in Firefox/YouTube Music first.")
+                print("No media sessions - start playback in Firefox/YouTube Music first.")
             for row in rows:
                 print(row)
             return 0
@@ -2521,7 +2642,7 @@ async def main_async(args):
                 time.sleep(5)
                 players = mpris.list()
             if not players:
-                sys.exit("No MPRIS players found — start YouTube Music / a video first.")
+                sys.exit("No MPRIS players found - start YouTube Music / a video first.")
             player = players[0]
             print("Using player:", player)
         backend = MprisBackend(player, link)
@@ -2531,8 +2652,8 @@ async def main_async(args):
             sys.exit("--cmd takes one of p n b - + u d l")
         meta = await backend.read()
         if meta is None:
-            sys.exit("No media session found — start playback first.")
-        print(f"player: {meta['app'] or '?'} — {meta['title']} / {meta['artist']}")
+            sys.exit("No media session found - start playback first.")
+        print(f"player: {meta['app'] or '?'} - {meta['title']} / {meta['artist']}")
         if args.cmd in CMD_VOLUME:
             level = backend.volume(CMD_VOLUME[args.cmd])
             print("volume:", "unavailable" if level is None else f"{level}%")
@@ -2595,7 +2716,7 @@ def main():
                          "(for running as a service from login)")
     ap.add_argument("--dump", action="store_true",
                     help="print the track the bridge would send, then exit "
-                         "(no Flipper needed — good first check)")
+                         "(no Flipper needed - good first check)")
     ap.add_argument("--cmd", metavar="KEY",
                     help="send one device command and exit: p n b - + u d l")
     ap.add_argument("--pair", action="store_true",

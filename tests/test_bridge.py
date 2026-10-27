@@ -33,7 +33,7 @@ def free_port():
 
 
 def parse_frame(blob):
-    """[type:1][len:2 LE][payload] — the device's own layout."""
+    """[type:1][len:2 LE][payload] - the device's own layout."""
     assert len(blob) >= 3, blob
     kind = blob[0]
     length = int.from_bytes(blob[1:3], "little")
@@ -354,6 +354,63 @@ class BrowserLinkTests(unittest.TestCase):
         self.assertTrue(helper.fresh())
         self.assertTrue(helper.liked)
         helper.close()
+
+
+class DeviceTextTests(unittest.TestCase):
+    """Titles the Flipper cannot draw are converted on the way out, not left blank.
+
+    The device's fonts are Latin-only bitmap faces, so non-Latin bytes had no
+    glyph and the screen showed gaps where the title should be.
+    """
+
+    def test_accents_fold_to_base_letters(self):
+        self.assertEqual(y.device_text("Tïtle"), "Title")
+        self.assertEqual(y.device_text("naïve café"), "naive cafe")
+
+    def test_hangul_romanises_without_a_dictionary(self):
+        # Hangul decomposes mechanically, so this needs no dependency at all.
+        self.assertEqual(y.device_text("알루미늄"), "alluminyum")
+        self.assertEqual(y.device_text("안녕하세요"), "annyeonghaseyo")
+
+    def test_unsupported_scripts_are_marked_not_blank(self):
+        # No glyph and no dictionary: a marker beats silent empty space.
+        self.assertEqual(y.device_text("عربي"), "????")
+
+    def test_the_result_is_always_drawable_ascii(self):
+        for text in ("Tïtle", "알루미늄", "日本語", "もしもし", "北京", "😀", "",
+                     "   ", "plain", "ＡＢＣ"):
+            out = y.device_text(text)
+            self.assertTrue(all(0x20 <= ord(c) < 0x7F for c in out),
+                            f"{text!r} -> {out!r} still has something the font cannot draw")
+
+    def test_ascii_is_left_alone(self):
+        self.assertEqual(y.device_text("Busker, Clown, Dancer"), "Busker, Clown, Dancer")
+
+    def test_whitespace_is_trimmed(self):
+        self.assertEqual(y.device_text("  padded  "), "padded")
+
+    def test_the_frame_builder_stays_a_pure_formatter(self):
+        # The conversion happens on the way out (device_meta), not inside
+        # meta_frame: the builder must keep carrying whatever it is handed, or
+        # the byte-for-byte parity with the extension's builder stops meaning
+        # anything. The raw spelling also has to survive for the cache key and
+        # the yt-dlp search.
+        m = {"playing": True, "pos": 1, "dur": 2, "title": "알루미늄", "artist": ""}
+        self.assertIn("알루미늄".encode("utf-8"), y.meta_frame(m))
+
+    def test_the_frame_that_is_actually_sent_is_drawable(self):
+        # End of the chain: what push() hands the frame builder - decoded back
+        # out of the payload, so this fails if the layout or the conversion
+        # moves.
+        m = {"playing": True, "pos": 3, "dur": 200,
+             "title": "알루미늄", "artist": "Broken Valentine"}
+        payload = y.meta_frame(y.device_meta(m))
+        self.assertEqual(payload[0], y.FRAME_META)
+        body = payload[3:]                      # state, pos, dur, then the text
+        title, artist = body[5:].split(b"\x00")[:2]
+        self.assertEqual(title, b"alluminyum")
+        self.assertEqual(artist, b"Broken Valentine")
+        self.assertTrue(all(0x20 <= b < 0x7F for b in title + artist))
 
 
 if __name__ == "__main__":

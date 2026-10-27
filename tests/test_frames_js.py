@@ -1,7 +1,7 @@
 """Byte parity between the extension's frames and ytm_bridge's.
 
 Both hosts speak the same wire format to the same firmware, so any drift is a
-silent corruption on the device — and the JavaScript half had no test at all.
+silent corruption on the device - and the JavaScript half had no test at all.
 The real file is loaded in node (see extension/test/frame_parity.mjs), never a
 re-implementation, so this cannot pass while the shipped code is wrong.
 
@@ -74,6 +74,20 @@ class FrameParityTests(unittest.TestCase):
     def test_multibyte_text_splits_the_same_way(self):
         meta = {"playing": True, "pos": 5, "dur": 9, "title": "é" * 40, "artist": ""}
         self.assertParity("meta_split_char", y.meta_frame(meta, with_text=True))
+
+    # Same list, same order, as DRAWABLE_CASES in extension/test/frame_parity.mjs.
+    DRAWABLE_CASES = ["Tïtle", "naïve café", "알루미늄", "안녕하세요",
+                      "Busker, Clown, Dancer", "", "  padded  ", "ＡＢＣ １２３",
+                      "عربي", "😀 🎵"]
+
+    def test_the_page_to_device_conversion_matches(self):
+        # Both hosts convert titles for the same Latin-only fonts, so if the two
+        # drift the same track shows different text depending on the browser.
+        js = json.loads(self.js["drawable"])
+        self.assertEqual(len(js), len(self.DRAWABLE_CASES),
+                         "the case lists in the harness and here must stay the same length")
+        for case, from_js in zip(self.DRAWABLE_CASES, js):
+            self.assertEqual(y.device_text(case), from_js, f"the hosts disagree on {case!r}")
 
 
 if __name__ == "__main__":

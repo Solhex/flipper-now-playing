@@ -7,7 +7,7 @@ Package the extension for both browser families.
 One source, two manifests: Chrome and Firefox disagree about how a Manifest V3
 background script is declared (service worker vs event page) and Firefox wants a
 `browser_specific_settings` block while Chromium warns about it. Everything else
-— the content script, the worker, the icons — is shared byte for byte.
+- the content script, the worker, the icons - is shared byte for byte.
 
 The `.xpi` is just a zip; signing is what makes Firefox install it permanently,
 see the README.
@@ -21,7 +21,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 DIST = HERE / "dist"
 # remote.html/remote.js are the Web Bluetooth link page: a document is the only
-# context that can hold the GATT connection, so it ships with every target —
+# context that can hold the GATT connection, so it ships with every target -
 # except Firefox, which has no Web Bluetooth and cannot use any of it.
 SHARED = ("content.js", "background.js", "remote.html", "remote.js")
 WEB_BLUETOOTH_ONLY = ("remote.html", "remote.js")
@@ -92,7 +92,7 @@ def main():
         print(f"{target:8} {archive.relative_to(HERE)}  ({size} bytes)  "
               f"unpacked in {folder.relative_to(HERE)}")
     print("\nFirefox, permanently: sign the .xpi (see README) and then")
-    print("  about:addons -> gear -> Install Add-on From File…")
+    print("  about:addons -> gear -> Install Add-on From File...")
     print("Chrome/Edge: chrome://extensions -> Load unpacked -> extension/dist/chrome")
 
 

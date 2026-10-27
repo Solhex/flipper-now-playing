@@ -9,3 +9,10 @@ websocket-client>=1.6
 # Without it the elapsed time still ticks, but the total and the progress bar
 # stay empty.
 yt-dlp
+
+# Optional: romanise Japanese and Chinese titles for the Flipper's Latin-only
+# fonts (Korean needs nothing - Hangul romanises mechanically). Without them
+# those characters show '?' rather than blank space. The browser extension
+# always marks them, as it cannot carry these dictionaries.
+# pykakasi
+# pypinyin

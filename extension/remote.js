@@ -1,7 +1,7 @@
 /* Flipper link, held by this extension page.
  *
  * Web Bluetooth is not available in a service worker (nor in Web Workers), so
- * the GATT connection has to live in a real document — that is what this page
+ * the GATT connection has to live in a real document - that is what this page
  * is. Keep the tab open (pinned is fine): closing it drops the Flipper link,
  * because the connection is bound to this document.
  *
@@ -45,10 +45,57 @@ port.onMessage.addListener((msg) => {
   if (msg && msg.type === "state") onState(msg.payload);
 });
 
+/* --- What the device can actually draw ------------------------------------
+ * The Flipper's fonts are Latin-only bitmap faces, so a Korean or Japanese title would
+ * reach the screen as blank space. Fold accents, romanise Hangul (mechanical,
+ * so it needs no dictionary) and mark anything else with '?'. Mirrors
+ * device_text() in ytm_bridge.py, which also romanises Japanese and Chinese
+ * when its optional dictionaries are installed; the extension cannot bundle
+ * megabytes of readings, so it marks those.
+ */
+const HANGUL_INITIAL = ["g", "kk", "n", "d", "tt", "r", "m", "b", "pp", "s", "ss",
+  "", "j", "jj", "ch", "k", "t", "p", "h"];
+const HANGUL_MEDIAL = ["a", "ae", "ya", "yae", "eo", "e", "yeo", "ye", "o", "wa",
+  "wae", "oe", "yo", "u", "wo", "we", "wi", "yu", "eu", "ui", "i"];
+const HANGUL_FINAL = ["", "k", "k", "k", "n", "n", "n", "t", "l", "k", "m", "p", "l",
+  "l", "p", "l", "m", "p", "p", "t", "t", "ng", "t", "t", "k", "t", "p", "t"];
+
+function hangulToLatin(text) {
+  let out = "";
+  let previousL = false;      /* a final -l doubles into a following -r onset */
+  for (const ch of text) {
+    const code = ch.codePointAt(0);
+    if (code < 0xac00 || code > 0xd7a3) { out += ch; previousL = false; continue; }
+    const offset = code - 0xac00;
+    let initial = HANGUL_INITIAL[Math.floor(offset / 588)];
+    const medial = HANGUL_MEDIAL[Math.floor((offset % 588) / 28)];
+    const final = HANGUL_FINAL[offset % 28];
+    if (previousL && initial === "r") initial = "l";
+    out += initial + medial + final;
+    previousL = final === "l";
+  }
+  return out;
+}
+
+function drawable(text) {
+  if (!text) return "";
+  if (/[^\x00-\x7f]/.test(text)) {
+    text = hangulToLatin(text)
+      .normalize("NFKD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .replace(/[^\x20-\x7e]/gu, "?");
+  }
+  return text.trim();
+}
+
 function onState(p) {
   const prev = state;
-  state = p;
-  if (!prev || prev.title !== p.title || prev.artist !== p.artist) textDirty = true;
+  /* The Flipper's fonts are Latin-only, so the device gets a drawable form
+   * (mirrors device_text() in ytm_bridge.py). Everything the page reports stays
+   * raw for the display below and for the change check, so a title that
+   * romanises to the same letters does not resend every tick. */
+  state = { ...p, title: drawable(p.title || ""), artist: drawable(p.artist || "") };
+  if (!prev || prev.title !== state.title || prev.artist !== state.artist) textDirty = true;
   if (!p.art || p.art !== lastArt) maybeSendArt(p.art);
   maybeSendLike(p.liked === null ? LIKE_UNKNOWN : (p.liked ? LIKE_YES : LIKE_NO));
   if (typeof p.vol === "number" && p.vol !== lastVol) sendVol(p.vol);
@@ -125,7 +172,7 @@ async function maybeSendArt(url) {
     const bmp = await createImageBitmap(blob);
     /* Skip two tracks quickly and the slower fetch finishes last: without this
      * the previous track's cover lands on the device wearing the new track's
-     * name (the Python bridge had the same bug — commit 210fb36). */
+     * name (the Python bridge had the same bug - commit 210fb36). */
     if (url !== lastArt) {
       bmp.close && bmp.close();
       return;
@@ -141,7 +188,7 @@ async function maybeSendArt(url) {
   }
 }
 
-/* Downscale to 1-bit, Floyd–Steinberg, dark pixels set, bits LSB-first — the
+/* Downscale to 1-bit, Floyd-Steinberg, dark pixels set, bits LSB-first - the
  * order canvas_draw_xbm expects. Mirrors art_to_xbm() in ytm_bridge.py. */
 function toXbm(bmp, size) {
   const c = document.createElement("canvas");
@@ -198,11 +245,11 @@ function setStatus(text, ok) {
 
 /* Registered once per device. Adding this inside connectWith() meant every
  * reconnect added another handler, so a single drop fired N reconnects at once
- * — N simultaneous attempts at the one link. */
+ * - N simultaneous attempts at the one link. */
 let hookedDevice = null;
 
 function onDisconnected() {
-  setStatus("Disconnected — reconnecting…", false);
+  setStatus("Disconnected - reconnecting...", false);
   server = rxChar = txChar = null;
   setTimeout(() => connectWith(device), 3000);
 }
@@ -232,11 +279,11 @@ async function connectWith(dev) {
 async function requestConnect() {
   try {
     if (!navigator.bluetooth) {
-      setStatus("This browser has no Web Bluetooth — use Firefox with the Python bridge.", false);
+      setStatus("This browser has no Web Bluetooth - use Firefox with the Python bridge.", false);
       port.postMessage({ type: "mode", mode: "bridge" });
       return;
     }
-    setStatus("Choose your Flipper in the browser prompt…", false);
+    setStatus("Choose your Flipper in the browser prompt...", false);
     const dev = await navigator.bluetooth.requestDevice({
       filters: [{ services: [SERIAL_SVC] }],
       optionalServices: [SERIAL_SVC],
@@ -282,10 +329,10 @@ function pushLoop() {
 /* ------------------------------------------------------------------ UI */
 function show(p) {
   if (!p) return;
-  $("track").textContent = (p.title || "—") + (p.artist ? " — " + p.artist : "");
-  const like = p.liked === null ? "?" : (p.liked ? "♥" : "♡");
+  $("track").textContent = (p.title || "-") + (p.artist ? " - " + p.artist : "");
+  const like = p.liked === null ? "?" : (p.liked ? "<3" : "--");
   const t = (s) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
-  $("meta").textContent = `${like}   ${t(p.pos || 0)} / ${t(p.dur || 0)}   ${p.playing ? "▶" : "⏸"}   vol ${p.vol ?? "?"}%`;
+  $("meta").textContent = `${like}   ${t(p.pos || 0)} / ${t(p.dur || 0)}   ${p.playing ? ">" : "||"}   vol ${p.vol ?? "?"}%`;
 }
 
 $("connect").addEventListener("click", requestConnect);

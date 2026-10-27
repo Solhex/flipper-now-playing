@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-windows_startup — make the bridge start by itself when you log in to Windows.
+windows_startup - make the bridge start by itself when you log in to Windows.
 
     python windows_startup.py install --name Gumi     # add it
     python windows_startup.py status                  # is it registered?
@@ -18,7 +18,7 @@ Two details worth keeping:
   shortcut inherits almost no environment, so anything that relied on the
   current directory or on PATH would quietly fail at login.
 * The arguments carry `--name` and `--log` explicitly, because that shortcut is
-  the only place the setting lives — unlike the Linux service there is no unit
+  the only place the setting lives - unlike the Linux service there is no unit
   file to read it back from.
 """
 
@@ -42,7 +42,7 @@ BRIDGE = HERE / "ytm_bridge.py"
 def startup_dir():
     appdata = os.environ.get("APPDATA")
     if not appdata:
-        sys.exit("APPDATA is not set — this only works on Windows")
+        sys.exit("APPDATA is not set - this only works on Windows")
     return Path(appdata) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
 
 
@@ -99,7 +99,7 @@ $lnk.Save()
         sys.exit(f"could not create the Firefox shortcut: {result.stderr.strip()}")
     print(f"Created: {target}")
     print(f"  runs: {firefox_exe()} --remote-debugging-port={port}")
-    print("\nQuit Firefox completely, then start it from that shortcut — the debug port")
+    print("\nQuit Firefox completely, then start it from that shortcut - the debug port")
     print("belongs to whichever instance starts first.")
 
 
@@ -207,7 +207,7 @@ def main():
     args = ap.parse_args()
 
     if os.name != "nt":
-        sys.exit("windows_startup.py is Windows-only; on Linux use ytm-remote.service")
+        sys.exit("windows_startup.py is Windows-only; on Linux use linux_startup.py")
     if not BRIDGE.exists():
         sys.exit(f"ytm_bridge.py not found next to this script ({BRIDGE})")
 

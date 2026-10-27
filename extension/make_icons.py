@@ -1,4 +1,4 @@
-"""Generate the extension's icons — a white heart on Flipper orange.
+"""Generate the extension's icons - a white heart on Flipper orange.
 
 Run once; the PNGs are committed so building the package needs no Pillow:
 

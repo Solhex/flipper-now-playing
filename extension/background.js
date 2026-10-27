@@ -1,6 +1,6 @@
 /* Relays between the YouTube Music tabs, the Flipper link page (remote.html)
- * and — only when the extension page says it is not holding the Bluetooth link
- * itself — the old loopback bridge.
+ * and - only when the extension page says it is not holding the Bluetooth link
+ * itself - the old loopback bridge.
  *
  * The work sits here rather than in the content script so requests come from the
  * extension's own origin: page CSP and Chrome's public-to-private rules then
@@ -43,7 +43,7 @@ async function postState(payload) {
       body: JSON.stringify(payload),
     });
   } catch (error) {
-    /* bridge not running — the next heartbeat tries again */
+    /* bridge not running - the next heartbeat tries again */
   }
 }
 
@@ -243,7 +243,7 @@ chrome.runtime.onStartup.addListener(pollLoop);
 chrome.runtime.onInstalled.addListener(pollLoop);
 
 /* Chromium stops an idle service worker after ~30 s, and the long poll alone does
- * not reliably keep it alive — Brave in particular suspends it aggressively. The
+ * not reliably keep it alive - Brave in particular suspends it aggressively. The
  * alarm wakes the worker so the poll restarts; without it the bridge queues like
  * commands that nobody ever picks up. */
 chrome.alarms.create("keep-polling", { periodInMinutes: 0.5 });

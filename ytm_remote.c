@@ -1,5 +1,5 @@
 /*
- * YT Music Remote — Flipper Zero app (Momentum / community firmware)
+ * YT Music Remote - Flipper Zero app (Momentum / community firmware)
  *
  * Shows the track a PC is playing (YouTube Music over MPRIS) and sends playback
  * commands back. Transport is the Flipper's BLE serial profile: the PC-side
@@ -39,7 +39,7 @@
 #include <string.h>
 
 /* A bounded strnlen. The firmware API carries strnlen but has it disabled, and
- * the CI symbol check refuses any app that calls it — the local SDK build does
+ * the CI symbol check refuses any app that calls it - the local SDK build does
  * not catch this, it passed while CI failed. Going through memchr keeps this on
  * symbols the firmware exposes, and the compiler will not rewrite it back. */
 static size_t bounded_len(const char* s, size_t max) {
@@ -116,8 +116,8 @@ static size_t bounded_len(const char* s, size_t max) {
  * The public notification API cannot set LCD brightness (only backlight
  * on/off, the enforce-on/auto lock, and a forced-settings message the service
  * clears by itself), and furi_hal_light_set() is overwritten by the
- * notification service on every input event. What works — as used by
- * community clock apps — is to write the notification service's own setting
+ * notification service on every input event. What works - as used by
+ * community clock apps - is to write the notification service's own setting
  * and ask it to re-apply. That needs its private layout: on Momentum mntm-012
  * (API 87.1) NotificationApp's `settings` member sits at offset 40.
  *
@@ -278,7 +278,7 @@ static void backlight_hold(App* app, bool on) {
 /* ---- screensaver sleep ----
  *
  * The "Stay on" setting takes a backlight hold, and a hold beats a plain
- * "backlight off" message — so sleeping the screen means dropping the hold first
+ * "backlight off" message - so sleeping the screen means dropping the hold first
  * and re-taking it on wake.
  */
 static void screen_sleep(App* app) {
@@ -470,12 +470,12 @@ static void settings_key(App* app, InputEvent* event) {
 /* ---------------- input ---------------- */
 
 static void send_cmd(App* app, uint8_t c) {
-    /* Nothing to send to a PC that is not there — and a stale byte would be
+    /* Nothing to send to a PC that is not there - and a stale byte would be
      * delivered the moment one connects (the app runs for days). */
     if(app->bt_status != BtStatusConnected) return;
     /* Never talk to the BLE stack straight from the input callback: each
      * indication has to be acknowledged before the next one goes out, so a
-     * congested stack blocks the caller — and the input callback runs on the
+     * congested stack blocks the caller - and the input callback runs on the
      * GUI thread, which freezes the whole UI when that happens. Queue the byte
      * (non-blocking, dropped if full) and let the app thread pace it out. */
     furi_stream_buffer_send(app->tx, &c, 1, 0);
@@ -568,7 +568,7 @@ static int glyph_w(Canvas* canvas, char c) {
     return canvas_string_width(canvas, glyph);
 }
 
-/* Sum of the glyph advances — what the drawing below actually lays out.
+/* Sum of the glyph advances - what the drawing below actually lays out.
  * canvas_string_width() on the whole string can disagree with this (trailing
  * advance, wide glyphs), and when it does the marquee stops in the wrong place:
  * it scrolled past the end of the title, leaving blank space beside the last
@@ -609,7 +609,7 @@ static int scroll_overflow(Canvas* canvas, const char* text, int maxw) {
     return over > 0 ? over : 0;
 }
 
-/* Outlined bar with an inset fill — used for progress and volume alike. */
+/* Outlined bar with an inset fill - used for progress and volume alike. */
 static void
     draw_bar(Canvas* canvas, int x, int y, int w, int h, uint32_t done, uint32_t total) {
     canvas_draw_frame(canvas, x, y, w, h);
@@ -643,7 +643,7 @@ static void draw_settings(Canvas* canvas, App* app) {
         canvas_set_color(canvas, ColorBlack);
     }
 
-    /* Scroll bar, only when the list does not fit — a full-height bar would
+    /* Scroll bar, only when the list does not fit - a full-height bar would
      * suggest scrolling where there is none. */
     if(SettingCount > SETTINGS_VISIBLE) {
         int track_y = SETTINGS_ROW_Y - 9;
@@ -731,7 +731,7 @@ static void draw_now_playing(Canvas* canvas, App* app) {
     const char* title = app->title[0] ? app->title : "(untitled)";
     draw_scrolling(canvas, tx, 12, tw, title, app->scroll);
     draw_scrolling(canvas, tx, 24, tw, app->artist, app->scroll);
-    /* Only the marquee needs repeated redraws — and redrawing costs pixels the
+    /* Only the marquee needs repeated redraws - and redrawing costs pixels the
      * panel then ghosts, so the loop is told to animate only when a line really
      * does not fit. */
     int over_title = scroll_overflow(canvas, title, tw);
@@ -770,7 +770,7 @@ static void draw_now_playing(Canvas* canvas, App* app) {
     int h = text_top - text_gap - bar_y; /* the bar fills what is left */
     if(h > 0) draw_bar(canvas, 2, bar_y, 124, h, app->pos, app->dur);
 
-    /* A heart in the middle of the row under the bar — the time row is empty
+    /* A heart in the middle of the row under the bar - the time row is empty
      * there (elapsed hard left, total hard right), so it needs no room and covers
      * nothing. Only a liked track draws one: an unliked track is the normal case
      * and a cracked heart on every one of them was just noise on the screen. The
@@ -779,7 +779,7 @@ static void draw_now_playing(Canvas* canvas, App* app) {
     if(app->liked == 1) {
         int hx = 64 - HEART_W / 2;
         /* Two rows above the digit baseline (row 63 they sit on): level with the
-         * bar looked too high, level with the digits too low — this sits in
+         * bar looked too high, level with the digits too low - this sits in
          * between, in the gap the time row leaves in the middle. */
         int hy = 63 - HEART_H - 1;
         canvas_draw_xbm(canvas, hx, hy, HEART_W, HEART_H, HEART_BITS);
@@ -787,7 +787,7 @@ static void draw_now_playing(Canvas* canvas, App* app) {
 
     char elapsed[12], total[12];
     fmt_time(elapsed, sizeof(elapsed), app->pos);
-    /* An unknown length is not 0:00 — say so rather than display a wrong time. */
+    /* An unknown length is not 0:00 - say so rather than display a wrong time. */
     if(app->dur) {
         fmt_time(total, sizeof(total), app->dur);
     } else {
@@ -862,7 +862,7 @@ static void draw_volume_overlay(Canvas* canvas, App* app) {
 }
 
 /* Height of one line at x. Fixed low-frequency sines: long lazy curves, no two
- * alike — four amplitudes crossed with three whole wavelengths. The wavelengths
+ * alike - four amplitudes crossed with three whole wavelengths. The wavelengths
  * divide the screen exactly, so a stroke can run off one edge and carry straight
  * on from the other instead of vanishing at the edge. */
 static int wave_y(uint8_t wave, int x) {
@@ -873,7 +873,7 @@ static int wave_y(uint8_t wave, int x) {
 }
 
 /* Px per frame for one stroke: four speed tiers, so the lines never move in
- * lockstep. Constant speed, deliberately not a sine — a sinusoidal position
+ * lockstep. Constant speed, deliberately not a sine - a sinusoidal position
  * stalls at the ends of its swing and the line looks frozen. */
 static float wave_speed(uint8_t wave) {
     return WAVE_SPEED_MIN + (float)(wave % 4) * WAVE_SPEED_STEP;
@@ -884,7 +884,7 @@ static float wave_speed(uint8_t wave) {
  * Only WAVE_WINDOW pixels of each line are lit and they slide along it: that is
  * what reads as a line being drawn, and it keeps each frame nearly free, so the
  * panel does not ghost. A dotted tail would look better still but re-lights ~30
- * px per line per frame — the dots have to blink on and off as they travel. */
+ * px per line per frame - the dots have to blink on and off as they travel. */
 static void draw_screensaver(Canvas* canvas, App* app) {
     for(uint8_t wave = 0; wave < WAVE_COUNT; wave++) {
         int head = (int)app->wave_head[wave];
@@ -959,7 +959,7 @@ static bool handle_meta(App* app, const uint8_t* b, uint16_t len) {
 
     furi_mutex_acquire(app->mutex, FuriWaitForever);
     /* Note the position changes on every tick, so a new track is detected on the
-     * text alone — resetting the marquee on `changed` would pin it to column 0. */
+     * text alone - resetting the marquee on `changed` would pin it to column 0. */
     bool text_changed =
         have_text && (strcmp(app->title, title) != 0 || strcmp(app->artist, artist) != 0);
     bool changed = !app->have_meta || app->playing != playing || app->pos != pos ||
@@ -1011,7 +1011,7 @@ static bool handle_art(App* app, const uint8_t* b, uint16_t len) {
 
 /* Whether the current track is liked, so the screen can show a heart. The PC
  * knows it only when it can read YouTube Music's own button (Firefox's remote
- * debugging port); otherwise it sends 2 and nothing is drawn — better a blank
+ * debugging port); otherwise it sends 2 and nothing is drawn - better a blank
  * than a wrong heart. */
 static bool handle_like(App* app, const uint8_t* b, uint16_t len) {
     if(len < 1) return false;
@@ -1024,7 +1024,7 @@ static bool handle_like(App* app, const uint8_t* b, uint16_t len) {
     return changed;
 }
 
-/* A short message from the PC — how the like went, say. Shown for a moment;
+/* A short message from the PC - how the like went, say. Shown for a moment;
  * the loop clears it, like the volume overlay. */
 /* Payload: [icon:1][text...]. An older PC sends text only, which is why the
  * icon is read only when the first byte is a known icon id and more follows. */
@@ -1233,7 +1233,7 @@ int32_t ytm_remote_app(void* p) {
 
         /* Nothing paired: run the idle screensaver, and let the screen go dark
          * after a while. The BLE profile keeps advertising throughout, so the PC
-         * can still connect — the app is meant to sit here for days. */
+         * can still connect - the app is meant to sit here for days. */
         if(app->bt_status != BtStatusConnected) {
             uint32_t now = furi_get_tick();
             if(!app->slept) {
@@ -1250,7 +1250,7 @@ int32_t ytm_remote_app(void* p) {
         } else {
             if(app->slept) screen_wake(app); /* the PC turned up: light the screen */
             /* Marquee: step to the end, pause on the last portion, then start
-             * over — pausing at the start as well, so a new title can be read
+             * over - pausing at the start as well, so a new title can be read
              * before it moves. */
             if(app->scrolling && !app->settings_open) {
                 uint32_t now = furi_get_tick();

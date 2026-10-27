@@ -8,5 +8,5 @@
 winrt-Windows.Media.Control>=3.0
 winrt-Windows.Storage.Streams>=3.0
 
-# Per-app volume through Core Audio — the Windows mixer's slider.
+# Per-app volume through Core Audio - the Windows mixer's slider.
 pycaw>=20240210
