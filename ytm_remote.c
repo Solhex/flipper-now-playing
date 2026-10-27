@@ -11,7 +11,8 @@
  *     0x01 META: [state:1][pos:2 LE][dur:2 LE][title utf8]\0[artist utf8]\0
  *                state: 0 = paused, 1 = playing; pos/dur in seconds
  *     0x02 ART : [w:1][h:1][1-bit rows, (w+7)/8 per row, LSB-first per byte]
- *     0x03 VOL : [volume:1]   0..100, shows the volume overlay
+ *     0x03 VOL : [volume:1]   0..100, shows the volume overlay;
+ *                              255 = unknown, draws '--' instead of a number
  *   Unknown types and oversized payloads are dropped, and a frame boundary
  *   lost to an overrun resyncs on the next type byte.
  *
@@ -194,7 +195,7 @@ struct App {
     uint8_t toast_icon; /* TOAST_ICON_* drawn before the toast text */
 
     uint8_t volume; /* last volume reported by the PC, 0..100 */
-    bool have_vol; /* PC has reported a volume at least once */
+    bool vol_known; /* false = the PC has no number to vouch for: draw '--' */
     uint32_t vol_until; /* tick until which the overlay is drawn */
     bool vol_clear_pending; /* still owe one redraw to erase the overlay */
 
@@ -208,6 +209,7 @@ struct App {
     FuriHalBleProfileBase* ble;
     FuriStreamBuffer* rx;
     FuriStreamBuffer* tx; /* outbound command bytes, sent by the app thread */
+    Parser* parser; /* the app loop's parser, so a dropped link can reset it */
     Gui* gui;
     ViewPort* vp;
     NotificationApp* notif;
@@ -700,9 +702,15 @@ static void draw_now_playing(Canvas* canvas, App* app) {
 
     canvas_draw_str(canvas, tx, 36, app->playing ? "Playing" : "Paused");
 
-    if(app->have_vol) {
+    /* Always drawn, so the row never claims a volume the PC cannot vouch for:
+     * '--' when the player is not the thing making sound. */
+    {
         char vol[8];
-        snprintf(vol, sizeof(vol), "%u%%", (unsigned)app->volume);
+        if(app->vol_known) {
+            snprintf(vol, sizeof(vol), "%u%%", (unsigned)app->volume);
+        } else {
+            snprintf(vol, sizeof(vol), "--");
+        }
         canvas_draw_str_aligned(canvas, 126, 36, AlignRight, AlignBottom, vol);
     }
 
@@ -965,17 +973,27 @@ static bool handle_toast(App* app, const uint8_t* b, uint16_t len) {
     return true;
 }
 
+#define VOL_UNKNOWN 255
+
 /* Always redraws: a volume frame means someone is adjusting, and refreshing the
- * overlay deadline is what keeps it on screen. */
+ * overlay deadline is what keeps it on screen.
+ *
+ * VOL_UNKNOWN clears the number instead: a paused player's slider is not the
+ * loudness in the room, and the row used to keep claiming the old value. The
+ * overlay deadline is left alone so the feedback of a press just made still
+ * shows for its moment. */
 static bool handle_vol(App* app, const uint8_t* b, uint16_t len) {
     if(len < 1) return false;
-    uint8_t v = b[0] > 100 ? 100 : b[0];
 
     furi_mutex_acquire(app->mutex, FuriWaitForever);
-    app->volume = v;
-    app->have_vol = true;
-    app->vol_until = furi_get_tick() + VOL_SHOW_MS;
-    app->vol_clear_pending = true;
+    if(b[0] == VOL_UNKNOWN) {
+        app->vol_known = false;
+    } else {
+        app->volume = b[0] > 100 ? 100 : b[0];
+        app->vol_known = true;
+        app->vol_until = furi_get_tick() + VOL_SHOW_MS;
+        app->vol_clear_pending = true;
+    }
     furi_mutex_release(app->mutex);
     return true;
 }
@@ -1053,6 +1071,10 @@ static void bt_status_changed(BtStatus status, void* context) {
     /* announce once per connection (the PC may be another instance entirely) */
     if(status != BtStatusConnected) {
         app->announced = false;
+        /* A link that dropped mid-frame leaves the parser waiting for the rest
+         * of that payload, so the next connection's first bytes are eaten as it.
+         * Reset it with the queue - the frame boundary is gone either way. */
+        if(app->parser) memset(app->parser, 0, sizeof(Parser));
         /* drop anything queued for the PC that just left */
         if(app->tx) furi_stream_buffer_reset(app->tx);
     }
@@ -1124,10 +1146,14 @@ int32_t ytm_remote_app(void* p) {
     app->rx = furi_stream_buffer_alloc(RX_STREAM_SIZE, 1);
     app->tx = furi_stream_buffer_alloc(TX_QUEUE_LEN, 1);
 
-    ble_start(app);
-
+    /* Declared before the BLE profile starts: bt_status_changed resets it when
+     * the PC goes away, so a frame cut in half cannot leak into the next link. */
     Parser parser;
     memset(&parser, 0, sizeof(parser));
+    app->parser = &parser;
+
+    ble_start(app);
+
     uint8_t chunk[160];
     uint32_t last_tx = 0;
 

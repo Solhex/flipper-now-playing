@@ -45,6 +45,9 @@ out.meta_clock = hex(y.metaFrame(false));
 out.like_yes = hex(y.likeFrame(1));
 out.like_unknown = hex(y.likeFrame(2));
 out.vol = hex(y.volFrame(100));
+/* '--' on the device: no number while the player is not the audio you hear. */
+out.vol_unknown = hex(y.volFrame(null));
+out.vol_clamped = hex(y.volFrame(140));
 out.toast = hex(y.toastFrame("Liked", 1));
 
 /* 8x2 art with a known pattern: checks the envelope and that bits land
@@ -58,6 +61,11 @@ out.meta_truncated = hex(y.metaFrame(true));
  * so both must produce the same (possibly invalid) tail. */
 y.setState({ playing: true, pos: 5, dur: 9, title: "é".repeat(40), artist: "" });
 out.meta_split_char = hex(y.metaFrame(true));
+
+/* Past 16 bits both hosts clamp to 65535; a plain mask would wrap to 0, and the
+ * mask used to be exactly what this did. */
+y.setState({ playing: true, pos: 70000, dur: 999999, title: "x", artist: "y" });
+out.meta_clamped = hex(y.metaFrame(false));
 
 /* The page -> device conversion. Must match device_text() in ytm_bridge.py for
  * everything both sides can do; the list is duplicated in tests/test_frames_js.py

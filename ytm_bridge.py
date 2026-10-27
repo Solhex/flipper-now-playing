@@ -17,7 +17,7 @@ which is what the per-platform backends below deal with.
 Wire format (PC -> Flipper) - [type:1][len:2 LE][payload:len]
     0x01 META: [state:1][pos:2 LE][dur:2 LE][title utf8]0[artist utf8]0
     0x02 ART : [w:1][h:1][1-bit XBM rows, LSB-first per byte, (w+7)/8 per row]
-    0x03 VOL : [volume:1]  0..100
+    0x03 VOL : [volume:1]  0..100, 255 = unknown (the device draws '--')
 Flipper -> PC: one command byte each (CMD_TRANSPORT / CMD_VOLUME below)
     p play/pause   n next   b previous   - seek back   + seek forward
     u volume up    d volume down
@@ -90,16 +90,16 @@ EXTENSION_PORT = 8765  # localhost port the browser extension posts the like sta
 
 FRAME_META, FRAME_ART, FRAME_VOL, FRAME_TOAST, FRAME_LIKE = 0x01, 0x02, 0x03, 0x04, 0x05
 LIKE_NO, LIKE_YES, LIKE_UNKNOWN = 0, 1, 2
+VOL_UNKNOWN = 255      # "no volume to show": the device draws '--'
 TOAST_MAX = 24         # the device shows one short line
 
 # ---------------------------------------------------------------- state files
-# Linux keeps its scratch under ~/.cache (what the service and check_time.py
-# expect); Windows uses LOCALAPPDATA so nothing lands in a hidden dot-directory.
+# Linux keeps its scratch under ~/.cache; Windows uses LOCALAPPDATA so nothing
+# lands in a hidden dot-directory.
 if IS_WINDOWS:
     STATE_DIR = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "ytm-remote"
 else:
     STATE_DIR = Path.home() / ".cache" / "ytm-remote"
-STATUS_PATH = str(STATE_DIR / "status.json")
 ADDRESS_PATH = str(STATE_DIR / "flipper.json")
 
 CMD_MAP_SEEK_BACK = f"{SEEK_STEP}-"
@@ -213,11 +213,14 @@ class BrowserLink:
         self.title = ""
         self.artist = ""
         self.playing = None
+        self.volume = None          # the page's own slider (its video volume)
         self.updated = 0.0          # monotonic, when /state last arrived
         self.requests = 0           # how many reports arrived since start
         self.changes = 0            # how many times "liked" actually changed
         self.probe = None           # last /diag payload: what the extension sees
-        self._gap_noted = False     # said "this extension is an old build" yet?
+        self._gap_noted = False     # said "an extension is polling but silent" yet?
+        self._no_access_noted = False   # said "grant the add-on site access" yet?
+        self._refused = set()       # origins seen blocked by CORS preflight
         self.polls = 0              # long-poll requests: proof the extension listens
         self._commands = queue.Queue()
         self._lock = threading.Lock()
@@ -230,7 +233,7 @@ class BrowserLink:
     # ---- state
     def update(self, liked, title="", artist="", playing=None, client=None,
                visible=None, focused=None, last_active=None, diag=None,
-               worker=""):
+               worker="", vol=None):
         """Record one tab's report and re-pick which tab the bridge follows."""
         client_id = client or "default"
         with self._lock:
@@ -238,6 +241,7 @@ class BrowserLink:
             record.update(liked=liked, title=title or "", artist=artist or "",
                           playing=playing, visible=visible, focused=focused,
                           lastActive=last_active, diag=diag,
+                          vol=vol if vol is not None else record.get("vol"),
                           worker=worker or record.get("worker", ""),
                           updated=time.monotonic())
             self.requests += 1
@@ -278,6 +282,7 @@ class BrowserLink:
             self.title = record.get("title", "")
             self.artist = record.get("artist", "")
             self.playing = record.get("playing")
+            self.volume = record.get("vol")
             self.updated = record.get("updated", 0.0)
             if changed:
                 self.changes += 1
@@ -301,6 +306,23 @@ class BrowserLink:
             worker = self.clients.get(target or "", {}).get("worker", "")
         self._commands.put({"cmd": "activate", "client": target, "worker": worker})
 
+    def request_volume(self, cmd):
+        """Ask the page to nudge its own volume slider (volup / voldown)."""
+        target = self.active_id
+        with self._lock:
+            worker = self.clients.get(target or "", {}).get("worker", "")
+        if self.remote_base:
+            try:
+                request = urllib.request.Request(
+                    f"{self.remote_base}/volume",
+                    data=json.dumps({"sign": 1 if cmd == "volup" else -1}).encode(),
+                    method="POST")
+                urllib.request.urlopen(request, timeout=5).read()
+            except Exception as exc:
+                print("  volume: could not reach the running bridge:", exc)
+            return
+        self._commands.put({"cmd": cmd, "client": target, "worker": worker})
+
     def request_restore(self, client=None):
         """Put the tab that was in front back where it was."""
         target = client or self.active_id
@@ -312,7 +334,8 @@ class BrowserLink:
         with self._lock:
             record = self.clients.get(self.active_id, {}) if self.active_id else {}
             return {"liked": self.liked, "title": self.title, "artist": self.artist,
-                    "playing": self.playing, "reports": self.requests,
+                    "playing": self.playing, "vol": self.volume,
+                    "reports": self.requests,
                     "changes": self.changes, "polls": self.polls,
                     "clients": len(self.clients), "client": self.active_id,
                     "focused": record.get("focused"), "visible": record.get("visible"),
@@ -330,7 +353,19 @@ class BrowserLink:
         """
         with self._lock:
             self.probe = probe
+            say = probe.get("siteAccess") is False and not self._no_access_noted
+            if say:
+                self._no_access_noted = True
         print("  <- extension probe:", json.dumps(probe, ensure_ascii=False))
+        if say:
+            # Measured on Firefox: an add-on whose hosts are not granted can
+            # still poll this port, so everything above looks healthy while it
+            # cannot inject into the page at all - no like state, no heart, and
+            # the like falls back to a blind keystroke. The grant needs a click.
+            print("  !! the add-on has no site access, so it cannot read the "
+                  "player: no heart, and a like is a blind keystroke. Click its "
+                  "toolbar icon once (\"Grant site access (once)\"), or turn the "
+                  "sites on in about:addons -> Permissions.")
 
     def note_probe_gap(self):
         """Say once, loudly, when an extension is talking but never reporting.
@@ -344,9 +379,10 @@ class BrowserLink:
             if self.probe is not None or self.polls < 3 or self._gap_noted:
                 return
             self._gap_noted = True
-        print("  .. an extension is polling but has never sent a probe: it is an "
-              "old build. Reload it from extension/dist/firefox (about:debugging), "
-              "and remove any installed copy sharing the same id.")
+        print("  .. an extension is polling but has never told us what it can "
+              "see: it is either older than the probe (reload it from "
+              "extension/dist/firefox) or its site access was never granted "
+              "(click its toolbar icon once).")
 
     def request_toggle(self, title="", client=None, worker=""):
         if not worker:
@@ -390,7 +426,7 @@ class BrowserLink:
                                 client=data.get("client") or "remote",
                                 visible=data.get("visible"),
                                 focused=data.get("focused"),
-                                diag=data.get("diag"))
+                                diag=data.get("diag"), vol=data.get("vol"))
                     with self._lock:
                         self.changes = max(self.changes, data.get("changes") or 0)
             except Exception:
@@ -403,25 +439,77 @@ class BrowserLink:
             return True
         link = self
 
+        EXTENSION_ORIGINS = ("moz-extension://", "chrome-extension://")
+        MAX_BODY = 64 * 1024   # a report or a probe is a few hundred bytes
+
         class Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.0"
 
-            def _reply(self, code, payload=b"{}", timeout=0):
+            def _cors(self):
+                """Answer CORS for extension origins, and only those.
+
+                A web page cannot set `Origin` to an extension scheme, so this
+                grants nothing to a site the user visits (`Allow-Origin: *` plus
+                the private-network opt-in was what really did - any page could
+                then POST /toggle, or fake the track). It is needed because an
+                add-on whose 127.0.0.1 host permission is not in effect is
+                CORS-preflighted on every POST - measured, and the state that a
+                freshly granted Firefox add-on sits in - which silently kills
+                the like state and the probe.
+                """
+                origin = self.headers.get("Origin") or ""
+                if origin.startswith(EXTENSION_ORIGINS):
+                    self.send_header("Access-Control-Allow-Origin", origin)
+                    self.send_header("Vary", "Origin")
+                    return origin
+                return ""
+
+            def _reply(self, code, payload=b"{}"):
                 self.send_response(code)
                 self.send_header("Content-Type", "application/json")
-                # Deliberately no CORS headers. The extension reaches this port
-                # through its host_permissions, so it needs none - and
-                # `Access-Control-Allow-Origin: *` plus the private-network
-                # opt-in is exactly what let ANY site you visit POST /toggle
-                # (a click, and on the fallback path a real Enter at your
-                # focused window) or fake the track on the Flipper.
+                self._cors()
                 self.send_header("Content-Length", str(len(payload)))
                 self.end_headers()
                 self.wfile.write(payload)
 
+            def _from_the_web(self):
+                """True for a caller that is neither a local tool nor the add-on.
+
+                A site can reach this port with a "simple request" (text/plain,
+                no preflight, response unreadable) - measured: a POST from
+                https://evil.example to /toggle queued a like press on the real
+                player. `Origin` is the only thing that tells the two apart, and
+                a page cannot forge an extension scheme. No Origin at all means a
+                local tool (curl, the tests), which stays allowed.
+                """
+                origin = self.headers.get("Origin") or ""
+                return bool(origin) and not origin.startswith(EXTENSION_ORIGINS)
+
+            def _refuse(self, origin):
+                """Log a refused caller once per origin, then answer 403."""
+                key = f"refused:{origin}"
+                with link._lock:
+                    first = key not in link._refused
+                    if len(link._refused) < 64:      # a local tool can send any Origin
+                        link._refused.add(key)
+                if first:
+                    print(f"  .. refused a request from {origin} (not an extension)")
+                self._reply(403, b'{"error":"origin refused"}')
+
             def do_POST(self):
-                length = int(self.headers.get("Content-Length") or 0)
-                body = self.rfile.read(length) if length else b"{}"
+                origin = self.headers.get("Origin") or ""
+                if self._from_the_web():
+                    self._refuse(origin)
+                    return
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                except ValueError:
+                    # `int()` raises on anything non-numeric, and an uncaught
+                    # raise here killed the handler thread while the client got
+                    # nothing at all (measured: status 000 from curl).
+                    self._reply(400, b'{"error":"bad content-length"}')
+                    return
+                body = self.rfile.read(min(max(length, 0), MAX_BODY)) if length else b"{}"
                 if self.path.startswith("/diag"):
                     # What the extension can see from inside itself: site access,
                     # which YouTube Music tabs it can find, and what the browser
@@ -434,6 +522,18 @@ class BrowserLink:
                         probe = {"error": "unparseable probe"}
                     link.set_probe(probe)
                     self._reply(200, b'{"ok":true}')
+                    return
+                if self.path.startswith("/volume"):
+                    # Same test hook idea as /toggle: nudge the page's own
+                    # slider, so the volume keys can be checked without hardware.
+                    sign = 1
+                    try:
+                        payload = json.loads(body or b"{}") or {}
+                        sign = -1 if payload.get("sign", 1) < 0 else 1
+                    except ValueError:
+                        pass
+                    link.request_volume("volup" if sign > 0 else "voldown")
+                    self._reply(200, b'{"queued":"volume"}')
                     return
                 if self.path.startswith("/toggle"):
                     # Test hook: the same command the Flipper's like button sends,
@@ -459,13 +559,62 @@ class BrowserLink:
                     data.get("playing"), client=data.get("client"),
                     visible=data.get("visible"), focused=data.get("focused"),
                     last_active=data.get("lastActive"), diag=data.get("diag"),
-                    worker=query.get("worker", [""])[0])
+                    worker=query.get("worker", [""])[0], vol=data.get("vol"))
                 if changed:
                     print(f"  <- browser: liked={link.liked} ({link.title[:30]!r}) "
                           f"[{link.active_id}{', focused' if data.get('focused') else ''}]")
                 self._reply(200, b'{"ok":true}')
 
+            def do_OPTIONS(self):
+                # The signature of an add-on whose 127.0.0.1 host permission is
+                # not in effect: the browser preflights its POST, and a 501 here
+                # silently eats every report. Answered for extension origins,
+                # refused for the web (see _cors).
+                origin = self.headers.get("Origin") or "?"
+                allowed = origin.startswith(EXTENSION_ORIGINS)
+                with link._lock:
+                    first = origin not in link._refused
+                    link._refused.add(origin)
+                if first:
+                    print(f"  .. CORS preflight from {origin} - "
+                          + ("answered (extension origin)" if allowed else "refused"))
+                if not allowed:
+                    self.send_response(501)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                self.send_response(204)
+                self.send_header("Access-Control-Allow-Origin", origin)
+                self.send_header("Access-Control-Allow-Methods", "GET, POST")
+                self.send_header("Access-Control-Allow-Headers", "Content-Type")
+                self.send_header("Access-Control-Max-Age", "600")
+                self.send_header("Vary", "Origin")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
             def do_GET(self):
+                # /wait and /diag have side effects: the poll hands out a queued
+                # command, and the probe is what the bridge trusts about the
+                # add-on. Both are simple requests a page can make, so a page
+                # could eat a like press out of the queue or fake the probe.
+                if self._from_the_web():
+                    self._refuse(self.headers.get("Origin") or "")
+                    return
+                if self.path.startswith("/diag"):
+                    # The probe arrives over GET on purpose. An add-on that has
+                    # not been granted its hosts is CORS-preflighted on every
+                    # POST (the browser asks OPTIONS first and this server
+                    # answers no CORS at all), so a POST probe is blocked in
+                    # exactly the state it exists to report: no site access.
+                    # A GET carries the same facts and is sent unnoticeably.
+                    query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                    try:
+                        probe = json.loads(query.get("probe", ["{}"])[0])
+                    except ValueError:
+                        probe = {"error": "unparseable probe"}
+                    link.set_probe(probe)
+                    self._reply(200, b'{"ok":true}')
+                    return
                 if self.path.startswith("/wait"):
                     with link._lock:
                         link.polls += 1
@@ -592,6 +741,68 @@ def link_toggle(link, title="", timeout=2.5, attempts=2, client=None):
     return None
 
 
+def parse_streams(text):
+    """[(index, application name, percent, corked)] from pactl list sink-inputs.
+
+    The mixer is the layer that decides how loud the music actually is, and one
+    application can own more than one stream: a browser leaves a corked stream
+    behind after a track change, and moving that one changes a number and nothing
+    else. `corked` is how the mixer says which streams are silent.
+    """
+    streams = []
+    index = app = percent = None
+    corked = False
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("Sink Input #"):
+            if index is not None and app and percent is not None:
+                streams.append((index, app, percent, corked))
+            index, app, percent, corked = int(line.split("#", 1)[1]), None, None, False
+        elif line.startswith("application.name = "):
+            app = line.split("=", 1)[1].strip().strip('"')
+        elif line.startswith("Corked:"):
+            corked = line.split(":", 1)[1].strip().lower() == "yes"
+        elif line.startswith("Volume:") and percent is None:
+            parts = line.split("/")
+            if len(parts) > 1:
+                try:
+                    percent = int(parts[1].strip().rstrip("%"))
+                except ValueError:
+                    percent = None
+    if index is not None and app and percent is not None:
+        streams.append((index, app, percent, corked))
+    return streams
+
+
+def pactl_streams():
+    """This machine's audio streams, or [] when there is no pactl (or no server)."""
+    try:
+        out = subprocess.run(["pactl", "list", "sink-inputs"],
+                             capture_output=True, text=True, timeout=3)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return []
+    return parse_streams(out.stdout)
+
+
+def link_volume(link, sign, timeout=1.5):
+    """Nudge the page's own volume; returns its level or None.
+
+    Kept for hosts without a mixer this bridge can reach (a browser-only setup):
+    the number the page reports and this key move the same media element.
+    """
+    if link is None or not link.fresh() or link.volume is None:
+        return None
+    before = link.volume
+    link.request_volume("volup" if sign > 0 else "voldown")
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        time.sleep(0.05)
+        if link.volume != before:
+            break
+    # Already at the end of the slider: report where it is rather than nothing.
+    return link.volume
+
+
 # =================================================== like state (Firefox BiDi)
 class FirefoxDebug:
     """Reads and toggles YouTube Music's like button through Firefox's remote agent.
@@ -684,8 +895,13 @@ class FirefoxDebug:
             self._call("session.new", {"capabilities": {}})
             self.context = None
             self.error = ""
-            return True
+            # Also release the session on an exit that is not SIGTERM: Firefox
+            # allows one BiDi session and does not notice a client that just
+            # vanished, so a crash would lock the like state out until Firefox
+            # restarts. (Registered here, where the session actually exists -
+            # this line used to sit after the return, i.e. never ran.)
             atexit.register(self.end)
+            return True
         except Exception as exc:              # port closed, another session, ...
             self.error = str(exc) or exc.__class__.__name__
             if "active sessions" in self.error:
@@ -818,6 +1034,7 @@ class MprisBackend:
         self._liked_at = 0.0
         self._liked_task = None
         self._refollow_at = 0.0
+        self._stream_cache = (0.0, None, None)   # (when, sink-input index, percent)
 
     # ---- helpers shared with the old module-level API
     def run_playerctl(self, *args):
@@ -908,15 +1125,27 @@ class MprisBackend:
         if art.startswith("file://") and os.path.exists(art[len("file://"):]):
             art_path = art[len("file://"):]
 
+        playing = f["status"].strip().lower() == "playing"
+        # Kept for the like path: the click is aimed at the tab playing this
+        # track, and _liked_state only fills this in when the debug port is used.
+        self._title = (f["xesam:title"] or "").strip()
+        # One number, in the order of what actually decides the loudness: this
+        # app's mixer stream, else the page's own volume (a host with no mixer
+        # we can reach), else what the player itself claims.
+        _, level = self.stream()
+        if level is None and self.link is not None and self.link.fresh():
+            level = self.link.volume
+        if level is None:
+            level = pct(f["volume"])
         return {
             "title": (f["xesam:title"] or "Unknown").strip(),
             "artist": (f["xesam:artist"] or "").strip(),
             "art": art_path,
-            "playing": f["status"].strip().lower() == "playing",
+            "playing": playing,
             "pos": us(f["position"]),
             "dur": us(f["mpris:length"]),
             "url": (f["xesam:url"] or "").strip(),
-            "vol": pct(f["volume"]),
+            "vol": level,
             "app": self.player or "",
             # MPRIS carries no like state: the browser extension, or Firefox's
             # debug port, is what knows it. The debug read happens in a worker
@@ -972,8 +1201,46 @@ class MprisBackend:
         else:
             print(f"  !! command {ch!r} failed: playerctl {' '.join(args)}")
 
+    def stream(self, force=False):
+        """This player's audio stream in the mixer: (index, percent) or (None, None).
+
+        Cached for a moment: the poll runs at 20 Hz and this shells out to pactl.
+        """
+        since, index, percent = self._stream_cache
+        if not force and time.monotonic() - since < 0.5:
+            return index, percent
+        app = (self.player or "").split(".instance")[0].lower()
+        found = (None, None)
+        matches = [s for s in pactl_streams() if app and app in s[1].lower()]
+        # The stream that is actually running, not merely the first: Firefox can
+        # own two, and the corked one is silent - moving it changed the Flipper's
+        # number while the music stayed exactly as loud.
+        running = [s for s in matches if not s[3]]
+        chosen = running or matches
+        if chosen:
+            found = (chosen[0][0], chosen[0][2])
+        self._stream_cache = (time.monotonic(), *found)
+        return found
+
     def volume(self, sign):
-        """Nudge the volume by VOLUME_STEP; returns the new level or None."""
+        """Nudge the music app's volume in the mixer; returns the new level or None.
+
+        The mixer, not the page: the page's volume claims a number the stream does
+        not follow (15% while the stream was at 100%), so it could not make the
+        music quieter. This is also the layer Windows already used (Core Audio),
+        and it works while paused.
+        """
+        index, _ = self.stream(force=True)
+        if index is not None:
+            step = f"{'+' if sign > 0 else '-'}{VOLUME_STEP * 100:.0f}%"
+            subprocess.run(["pactl", "set-sink-input-volume", str(index), step],
+                           capture_output=True)
+            _, level = self.stream(force=True)
+            if level is not None:
+                return level
+
+        if self.link is not None and self.link.fresh() and self.link.volume is not None:
+            return link_volume(self.link, sign)
         step = f"{VOLUME_STEP:g}{'+' if sign > 0 else '-'}"
         self.run_playerctl("volume", step)
         ok, out = self.run_playerctl("volume")
@@ -997,7 +1264,9 @@ class MprisBackend:
                 self._liked, self._liked_at = state, 0.0
                 return True, ("Liked" if state else "Unliked"), state
 
-        state = link_toggle(self.link)
+        # The title aims the click at the tab playing it: with two YouTube Music
+        # tabs open, an unaimed toggle can like the wrong one.
+        state = link_toggle(self.link, self._title)
         if state is not None:
             return True, ("Liked" if state else "Unliked"), state
 
@@ -1087,6 +1356,53 @@ def track_start_age(art_path, max_age=6 * 3600):
     except OSError:
         return None
     return age if 0 <= age < max_age else None
+
+
+# ------------------------------------------------ media-session logic (pure)
+# Both helpers below belong to the Windows backend but live out here on purpose:
+# inside `if IS_WINDOWS:` nothing can be imported on Linux, so no test could
+# ever fail when this choice or this guard breaks - and it breaks silently (a
+# wrong session shows the wrong track, an untrusted timeline shows no bar).
+def choose_session(sessions, hint, label, is_playing):
+    """The session to show: the hinted one, else a playing one, else the first.
+
+    `label` names a session and `is_playing` answers for one, so this is pure.
+    A pinned player that is not running returns None rather than falling back to
+    whatever else is playing - the wrong track must not reach the device.
+    """
+    if hint:
+        matches = [s for s in sessions
+                   if hint in label(s).lower()
+                   or hint in (getattr(s, "source_app_user_model_id", "") or "").lower()]
+        if not matches:
+            return None
+        for session in matches:
+            if is_playing(session):
+                return session
+        return matches[0]
+    for session in sessions:
+        if is_playing(session):
+            return session
+    return sessions[0] if sessions else None
+
+
+def trusted_timeline(guard, key, playing, raw, dur):
+    """(position, duration) to believe, or (0, 0) until the timeline is trusted.
+
+    Firefox's SMTC timeline is a snapshot from whenever YouTube Music last
+    published it: the position sits at zero and the total can still be the
+    previous track's. So a timeline only counts once its position has been seen
+    to move during this track; `guard` carries that between polls.
+    """
+    if key != guard["key"]:
+        guard.update(key=key, pos=raw, trusted=False)
+    elif playing and raw > guard["pos"] + 0.05:
+        guard["pos"], guard["trusted"] = raw, True
+    else:
+        guard["pos"] = raw
+    if not guard["trusted"]:
+        return 0, 0
+    return int(raw), dur
 
 
 # ============================================================== Windows: SMTC
@@ -1526,30 +1842,21 @@ if IS_WINDOWS:
 
         def _pick(self, sessions):
             """The session to show: the hinted one, else a playing one, else the first."""
-            if self.hint:
-                matches = [s for s in sessions
-                           if self.hint in self.label(s).lower()
-                           or self.hint in (getattr(s, "source_app_user_model_id", "") or "").lower()]
-                if matches:
-                    for session in matches:
-                        if session.get_playback_info().playback_status == self.Status.PLAYING:
-                            return session
-                    return matches[0]
+            def is_playing(session):
+                try:
+                    return session.get_playback_info().playback_status == self.Status.PLAYING
+                except Exception:
+                    return False
+
+            chosen = choose_session(sessions, self.hint, self.label, is_playing)
+            if self.hint and chosen is None and not self._warned_missing:
                 # A pinned player that is not running must not silently fall back
                 # to whatever else is playing: that would put the wrong track on
                 # the device.
-                if not self._warned_missing:
-                    self._warned_missing = True
-                    print(f"No media session matches --player {self.hint!r}; "
-                          f"waiting for it (see --list)")
-                return None
-            for session in sessions:
-                try:
-                    if session.get_playback_info().playback_status == self.Status.PLAYING:
-                        return session
-                except Exception:
-                    continue
-            return sessions[0] if sessions else None
+                self._warned_missing = True
+                print(f"No media session matches --player {self.hint!r}; "
+                      f"waiting for it (see --list)")
+            return chosen
 
         async def list(self):
             """Human-readable session list for --list."""
@@ -1701,18 +2008,7 @@ if IS_WINDOWS:
                 dur = max(0, int(end - start)) if end > start else 0
             except Exception:
                 return 0, 0
-
-            guard = self._guard
-            if key != guard["key"]:
-                guard.update(key=key, pos=raw, trusted=False)
-            elif playing and raw > guard["pos"] + 0.05:
-                guard["pos"], guard["trusted"] = raw, True
-            else:
-                guard["pos"] = raw
-
-            if not guard["trusted"]:
-                return 0, 0
-            return int(raw), dur
+            return trusted_timeline(self._guard, key, playing, raw, dur)
 
         def close(self):
             """Release the debug session and the extension port."""
@@ -2099,10 +2395,14 @@ def meta_frame(m, with_text=True):
     makes it ~80 bytes, which is three or four writes at MTU 23 - that was most
     of the delay between a second ticking and the Flipper showing it.
     """
+    # Clamped to 16 bits: to_bytes raises above 65535, and with an unknown
+    # length (a stream) nothing else caps the clock, so a long session would
+    # crash the push loop into a reconnect every 3 s. The extension clamps the
+    # same way, so the two hosts stay byte-identical.
     payload = (
         bytes([1 if m["playing"] else 0])
-        + int(m["pos"]).to_bytes(2, "little", signed=False)
-        + int(m["dur"]).to_bytes(2, "little", signed=False)
+        + max(0, min(int(m["pos"]), 0xFFFF)).to_bytes(2, "little", signed=False)
+        + max(0, min(int(m["dur"]), 0xFFFF)).to_bytes(2, "little", signed=False)
     )
     if with_text:
         payload += (
@@ -2136,6 +2436,14 @@ def like_frame(state):
 
 
 def vol_frame(level):
+    """0..100, or VOL_UNKNOWN when the player is not the audio you hear.
+
+    A paused player's slider says nothing about the loudness in the room, and
+    the device kept painting that stale number. It needs a distinct value so it
+    can clear the row instead.
+    """
+    if level is None:
+        return frame(FRAME_VOL, bytes([VOL_UNKNOWN]))
     return frame(FRAME_VOL, bytes([max(0, min(100, int(level)))]))
 
 
@@ -2392,34 +2700,8 @@ class Bridge:
         self.durations = {}
         self.length_tries = {}
         self.length_pending = set()
+        self.length_tasks = set()   # asyncio keeps only a weak ref to a task
         self.ytdlp = resolve_ytdlp()
-        self.status = {}
-        self.status_path = STATUS_PATH
-
-    def write_status(self, m):
-        """Snapshot for check_time.py, at most once a second."""
-        snapshot = {
-            "time": time.time(),
-            "title": m["title"],
-            "artist": m["artist"],
-            "playing": m["playing"],
-            "pos": m["pos"],
-            "dur": m["dur"],
-            "vol": m["vol"],
-        }
-        if (snapshot["pos"], snapshot["title"], snapshot["playing"]) == (
-            self.status.get("pos"), self.status.get("title"), self.status.get("playing")
-        ):
-            return
-        self.status = snapshot
-        try:
-            os.makedirs(os.path.dirname(self.status_path), exist_ok=True)
-            tmp = self.status_path + ".tmp"
-            with open(tmp, "w") as handle:
-                json.dump(snapshot, handle)
-            os.replace(tmp, self.status_path)
-        except OSError as e:
-            print("  status file:", e)
 
     async def duration_for(self, url, query):
         """Cached track length, or 0 while a lookup is in flight.
@@ -2454,7 +2736,12 @@ class Bridge:
             return 0
         self.length_tries[target] = now
         self.length_pending.add(target)
-        asyncio.create_task(self.resolve_duration(target))
+        # Keep a strong reference, or the loop may collect the task mid-lookup -
+        # and then its finally never clears length_pending, so that target can
+        # never get a length again in this process (shows --:-- forever).
+        task = asyncio.create_task(self.resolve_duration(target))
+        self.length_tasks.add(task)
+        task.add_done_callback(self.length_tasks.discard)
         return 0
 
     async def resolve_duration(self, target):
@@ -2597,11 +2884,10 @@ class Bridge:
             if liked != LIKE_UNKNOWN:
                 print(f"  -> like {'yes' if liked == LIKE_YES else 'no'}")
 
-        if m["vol"] is not None and m["vol"] != self.last_vol:
+        if m["vol"] != self.last_vol:
             await self.send_volume(m["vol"])
-            print(f"  -> volume {m['vol']}%")
-
-        self.write_status(m)
+            print("  -> volume unknown (not playing)" if m["vol"] is None
+                  else f"  -> volume {m['vol']}%")
 
     async def write(self, blob):
         for i in range(0, len(blob), self.chunk):

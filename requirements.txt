@@ -11,8 +11,5 @@ websocket-client>=1.6
 yt-dlp
 
 # Optional: romanise Japanese and Chinese titles for the Flipper's Latin-only
-# fonts (Korean needs nothing - Hangul romanises mechanically). Without them
-# those characters show '?' rather than blank space. The browser extension
-# always marks them, as it cannot carry these dictionaries.
-# pykakasi
-# pypinyin
+# fonts (Korean needs nothing - Hangul romanises mechanically). Those readings
+# live in requirements-cjk.txt: pip install -r requirements-cjk.txt

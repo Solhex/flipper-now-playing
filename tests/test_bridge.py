@@ -9,6 +9,7 @@ back byte by byte the way the device does.
 """
 
 import asyncio
+import contextlib
 import io
 import json
 import signal
@@ -16,7 +17,10 @@ import socket
 import sys
 import threading
 import time
+import types
 import unittest
+import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -65,6 +69,15 @@ class FrameTests(unittest.TestCase):
         self.assertEqual(len(title), y.TITLE_MAX)
         self.assertEqual(len(artist.rstrip(b"\0")), y.ARTIST_MAX)
 
+    def test_positions_past_16_bits_are_clamped_not_crashed(self):
+        # Nothing caps the clock when the player reports no length (a stream),
+        # and to_bytes raises above 65535 - which used to take the push loop down
+        # into a reconnect every 3 s. The extension clamps identically.
+        meta = {"playing": True, "pos": 70000, "dur": 999999,
+                "title": "x", "artist": "y"}
+        _, payload = parse_frame(y.meta_frame(meta, with_text=False))
+        self.assertEqual(payload[1:5], b"\xff\xff\xff\xff")
+
     def test_like_frame_clamps_state(self):
         for state, expected in ((0, 0), (1, 1), (2, 2), (7, 2), (-5, 0)):
             kind, payload = parse_frame(y.like_frame(state))
@@ -74,6 +87,13 @@ class FrameTests(unittest.TestCase):
     def test_vol_frame(self):
         kind, payload = parse_frame(y.vol_frame(140))
         self.assertEqual((kind, payload), (y.FRAME_VOL, b"\x64"))
+
+    def test_volume_can_say_unknown(self):
+        # A paused player's slider is not the loudness in the room, so the
+        # device has to be able to stop claiming a number ('--').
+        kind, payload = parse_frame(y.vol_frame(None))
+        self.assertEqual((kind, payload), (y.FRAME_VOL, bytes([y.VOL_UNKNOWN])))
+        self.assertEqual(y.VOL_UNKNOWN, 255)
 
     def test_toast_frame_carries_icon(self):
         kind, payload = parse_frame(y.toast_frame("Liked", icon=1))
@@ -159,7 +179,19 @@ class MprisParsingTests(unittest.TestCase):
             return True, line
 
         backend.run_playerctl = fake
+        backend.stream = lambda force=False: (None, None)   # no mixer in a test
         return backend
+
+    def test_the_mixer_level_wins_over_mpris(self):
+        # The mixer is the gain you hear; MPRIS only reports the player's own idea
+        # of its volume (which said 15% while the stream was at 100%).
+        line = "Playing\t0\t0\tSong\tArtist\t\t\t0.42\n"
+        backend = y.MprisBackend("firefox")
+        backend.run_playerctl = lambda *_a: (True, line)
+        backend.stream = lambda force=False: (414, 35)
+        meta = asyncio.run(backend.read())
+        assert meta is not None
+        self.assertEqual(meta["vol"], 35)
 
     def test_metadata_line_is_parsed(self):
         line = ("Playing\t42000000\t215000000\tSong\tArtist\t"
@@ -183,6 +215,14 @@ class MprisParsingTests(unittest.TestCase):
         self.assertEqual(meta["title"], "Unknown")
         self.assertEqual(meta["pos"], 0)
         self.assertFalse(meta["playing"])
+
+    def test_a_paused_player_still_reports_its_volume(self):
+        # Pausing must not blank the number: it is still the level the music
+        # resumes at, and a row that flickers on every pause is noise.
+        line = ("Paused\t0\t0\tSong\tArtist\t\t\t0.9\n")
+        meta = asyncio.run(self.backend(line).read())
+        assert meta is not None
+        self.assertEqual(meta["vol"], 90)
 
     def test_seek_step_matches_the_site(self):
         # YouTube Music's own seek controls step 5 s, so the device must not
@@ -300,6 +340,35 @@ class BrowserLinkTests(unittest.TestCase):
         self.assertTrue(self.link.liked)
         self.assertEqual(self.link.state()["title"], "Song")
 
+    def test_preflight_is_answered_for_extension_origins_only(self):
+        # An add-on whose 127.0.0.1 host permission is not in effect is
+        # preflighted before every POST; a 501 there silently eats the like
+        # state. A web page must still get nothing, or any site could drive the
+        # helper - and a page cannot set an extension Origin, so this is safe.
+        def options(origin):
+            request = urllib.request.Request(
+                f"{self.base}/state", method="OPTIONS",
+                headers={"Origin": origin, "Access-Control-Request-Method": "POST"})
+            try:
+                with urllib.request.urlopen(request, timeout=5) as reply:
+                    return reply.status, reply.headers.get("Access-Control-Allow-Origin")
+            except urllib.error.HTTPError as exc:
+                answer = (exc.code, exc.headers.get("Access-Control-Allow-Origin"))
+                exc.close()
+                return answer
+
+        self.assertEqual(options("moz-extension://abc"), (204, "moz-extension://abc"))
+        self.assertEqual(options("https://evil.example"), (501, None))
+
+    def test_probe_arrives_over_get_when_the_post_is_blocked(self):
+        # An add-on with no granted hosts is CORS-preflighted on every POST, so
+        # the probe has to travel on a GET - otherwise the one reading that says
+        # "no site access" is precisely the one that never arrives.
+        query = urllib.parse.urlencode({"probe": json.dumps({"siteAccess": False,
+                                                             "mode": "bridge"})})
+        urllib.request.urlopen(f"{self.base}/diag?{query}", timeout=5).read()
+        self.assertEqual(self.link.probe, {"siteAccess": False, "mode": "bridge"})
+
     def test_focused_tab_wins_over_a_later_background_one(self):
         self.post_state({"client": "a", "liked": True, "title": "Tab A",
                          "focused": True, "visible": True, "lastActive": 1000})
@@ -378,6 +447,251 @@ class BrowserLinkTests(unittest.TestCase):
             self.assertIn("error", json.load(reply)["probe"])
 
 
+class HttpTrustTests(unittest.TestCase):
+    """The loopback port is reachable from any page; only the add-on may act.
+
+    A cross-origin POST with `text/plain` is a "simple request" - no preflight,
+    sent by the browser whatever the server thinks - so `Origin` is the only
+    thing that separates a visited site from the add-on, and a page cannot forge
+    an extension scheme. Both holes here were measured, not imagined.
+    """
+
+    def setUp(self):
+        self.port = free_port()
+        self.link = y.BrowserLink(self.port)
+        self.assertTrue(self.link.start(), self.link.error)
+        self.base = f"http://127.0.0.1:{self.port}"
+
+    def tearDown(self):
+        self.link.close()
+
+    def request(self, path, data=None, origin=None, method="POST"):
+        headers = {"Content-Type": "text/plain"}
+        if origin:
+            headers["Origin"] = origin
+        request = urllib.request.Request(f"{self.base}{path}", data=data,
+                                         method=method, headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=5) as reply:
+                return reply.status
+        except urllib.error.HTTPError as exc:
+            code = exc.code
+            exc.close()
+            return code
+
+    def test_a_page_cannot_queue_a_like(self):
+        # Before this guard, this exact request liked a real track.
+        self.assertEqual(self.request("/toggle", origin="https://evil.example"), 403)
+        self.assertTrue(self.link._commands.empty())
+
+    def test_a_page_cannot_swallow_a_queued_command(self):
+        # The poll hands a command out of the queue: a page that gets there first
+        # eats it, and the Flipper's press silently does nothing.
+        self.link.request_toggle("Song", "tab")
+        self.assertEqual(self.request("/wait", method="GET",
+                                      origin="https://evil.example"), 403)
+        self.assertEqual(self.link._commands.qsize(), 1)
+
+    def test_a_page_cannot_fake_the_probe(self):
+        self.assertEqual(self.request("/diag", method="GET",
+                                      origin="https://evil.example"), 403)
+        self.assertIsNone(self.link.probe)
+
+    def test_the_add_on_is_still_allowed(self):
+        self.assertEqual(self.request("/toggle", origin="moz-extension://abc"), 200)
+
+    def test_a_local_tool_without_an_origin_is_still_allowed(self):
+        self.assertEqual(self.request("/toggle"), 200)
+
+    def test_a_bad_content_length_is_answered_instead_of_killing_the_handler(self):
+        # Measured: the handler died with ValueError and the client got nothing
+        # at all (curl reported status 000), while the traceback filled the log.
+        request = urllib.request.Request(
+            f"{self.base}/state", data=b"{}", method="POST",
+            headers={"Content-Length": "abc", "Content-Type": "application/json"})
+        with self.assertRaises(urllib.error.HTTPError) as caught:
+            urllib.request.urlopen(request, timeout=5)
+        self.assertEqual(caught.exception.code, 400)
+        caught.exception.close()
+
+
+class SinkInputParseTests(unittest.TestCase):
+    """The mixer is the layer that decides how loud the music really is.
+
+    The page's own volume claimed 15% while Firefox's stream sat at 100%, so
+    every press "did nothing" and the music stayed loud.
+    """
+
+    SAMPLE = (
+        "Sink Input #414\n"
+        "\tMute: no\n"
+        "\tVolume: front-left: 65536 / 100% / 0.00 dB,   front-right: 65536 / 100% / 0.00 dB\n"
+        "\t\tapplication.name = \"Firefox\"\n"
+        "\tmodule-stream-restore.id = \"sink-input-by-application-name:Firefox\"\n"
+        "\n"
+        "Sink Input #976\n"
+        "\tMute: no\n"
+        "\tVolume: front-left: 32768 /  50% / -6.02 dB,   front-right: 32768 /  50% / -6.02 dB\n"
+        "\t\tapplication.name = \"vesktop\"\n"
+    )
+
+    def test_streams_come_out_with_their_levels(self):
+        self.assertEqual(y.parse_streams(self.SAMPLE),
+                         [(414, "Firefox", 100, False), (976, "vesktop", 50, False)])
+
+    def test_junk_gives_no_streams(self):
+        self.assertEqual(y.parse_streams("no sink inputs here\n"), [])
+
+    def test_the_player_name_picks_its_own_stream(self):
+        backend = y.MprisBackend("firefox.instance_1_44")
+        original = y.pactl_streams
+        y.pactl_streams = lambda: y.parse_streams(self.SAMPLE)
+        try:
+            self.assertEqual(backend.stream(force=True), (414, 100))
+        finally:
+            y.pactl_streams = original
+
+    TWO_STREAMS = (
+        "Sink Input #414\n"
+        "\tCorked: yes\n"
+        "\tVolume: front-left: 19655 /  30% / -31.38 dB,   front-right: 19655 /  30% / -31.38 dB\n"
+        "\t\tapplication.name = \"Firefox\"\n"
+        "\n"
+        "Sink Input #2432\n"
+        "\tCorked: no\n"
+        "\tVolume: front-left: 19655 /  30% / -31.38 dB,   front-right: 19655 /  30% / -31.38 dB\n"
+        "\t\tapplication.name = \"Firefox\"\n"
+    )
+
+    def test_the_running_stream_wins_over_a_corked_one(self):
+        # Measured here: Firefox owned #414 (corked) and #2432 (running). Moving
+        # the corked one changed the Flipper's number and nothing else.
+        backend = y.MprisBackend("firefox.instance_1_44")
+        original = y.pactl_streams
+        y.pactl_streams = lambda: y.parse_streams(self.TWO_STREAMS)
+        try:
+            self.assertEqual(backend.stream(force=True), (2432, 30))
+        finally:
+            y.pactl_streams = original
+
+    def test_a_corked_stream_is_better_than_none(self):
+        # Paused: every stream may be corked, and its level is still the one the
+        # music resumes at.
+        backend = y.MprisBackend("firefox.instance_1_44")
+        original = y.pactl_streams
+        y.pactl_streams = lambda: y.parse_streams(self.SAMPLE)
+        try:
+            self.assertEqual(backend.stream(force=True), (414, 100))
+        finally:
+            y.pactl_streams = original
+
+
+class LinkVolumeTests(unittest.TestCase):
+    """The volume readout and keys use the page's own slider, not MPRIS.
+
+    MPRIS's volume for Firefox is a separate value: nudging it moved the
+    Flipper's number while the site's slider stayed put, and the two then
+    disagreed for the rest of the track.
+    """
+
+    def setUp(self):
+        self.port = free_port()
+        self.link = y.BrowserLink(self.port)
+        self.assertTrue(self.link.start(), self.link.error)
+        self.base = f"http://127.0.0.1:{self.port}"
+
+    def tearDown(self):
+        self.link.close()
+
+    def post(self, vol):
+        body = json.dumps({"liked": False, "title": "Song", "playing": True,
+                           "vol": vol}).encode()
+        request = urllib.request.Request(f"{self.base}/state", data=body, method="POST",
+                                         headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(request, timeout=5).read()
+
+    def test_no_extension_means_none(self):
+        self.assertIsNone(y.link_volume(self.link, +1, timeout=0.2))
+
+    def test_the_page_is_asked_and_its_new_level_comes_back(self):
+        self.post(50)
+        seen = []
+
+        def page():
+            with urllib.request.urlopen(f"{self.base}/wait", timeout=5) as reply:
+                seen.append(json.load(reply).get("cmd"))
+            self.post(55)              # the page moved its own slider
+
+        threading.Thread(target=page, daemon=True).start()
+        self.assertEqual(y.link_volume(self.link, +1, timeout=3.0), 55)
+        self.assertEqual(seen, ["volup"])
+
+    def test_staying_at_the_top_reports_where_it_is(self):
+        # At 100 the page clamps, so nothing changes - the answer is still 100,
+        # not "unknown" and not a fallback to a different volume.
+        self.post(100)
+
+        def page():
+            with urllib.request.urlopen(f"{self.base}/wait", timeout=5) as reply:
+                json.load(reply)
+
+        threading.Thread(target=page, daemon=True).start()
+        self.assertEqual(y.link_volume(self.link, +1, timeout=0.5), 100)
+
+    def test_the_page_volume_is_used_when_there_is_no_mixer(self):
+        self.post(30)
+        line = "Playing\t0\t0\tSong\tArtist\t\t\t0.9\n"
+        backend = y.MprisBackend("firefox", self.link)
+        backend.run_playerctl = lambda *_a: (True, line)
+        backend.stream = lambda force=False: (None, None)
+        meta = asyncio.run(backend.read())
+        assert meta is not None
+        self.assertEqual(meta["vol"], 30)      # the page, not MPRIS's 90
+
+    def test_the_test_hook_queues_the_page_nudge(self):
+        self.post(50)
+        request = urllib.request.Request(f"{self.base}/volume", data=b'{"sign":-1}',
+                                         method="POST")
+        urllib.request.urlopen(request, timeout=5).read()
+        with urllib.request.urlopen(f"{self.base}/wait", timeout=5) as reply:
+            self.assertEqual(json.load(reply)["cmd"], "voldown")
+
+    def test_a_live_page_is_not_overridden_by_mpris(self):
+        # No mixer, page reporting: the page is the control. A page that does not
+        # answer gives back its unchanged level - switching the number's source
+        # mid-press is what made the readout impossible to trust.
+        self.post(30)
+        backend = y.MprisBackend("firefox", self.link)
+        backend.run_playerctl = lambda *_a: (True, "0.55\n")
+        backend.stream = lambda force=False: (None, None)
+        self.assertEqual(backend.volume(+1), 30)
+
+    def test_the_key_moves_the_mixer_stream(self):
+        backend = y.MprisBackend("firefox")
+        backend.stream = lambda force=False: (414, 100)
+        calls = []
+        original = y.subprocess.run
+        y.subprocess.run = lambda args, **kw: calls.append(args) or types.SimpleNamespace(returncode=0)
+        try:
+            backend.volume(-1)
+        finally:
+            y.subprocess.run = original
+        self.assertIn(["pactl", "set-sink-input-volume", "414", "-5%"], calls)
+
+    def test_without_a_page_or_mixer_the_volume_keys_still_work(self):
+        backend = y.MprisBackend("firefox", None)
+        backend.stream = lambda force=False: (None, None)
+        calls = []
+
+        def fake(*args):
+            calls.append(args)
+            return True, "0.55\n"
+
+        backend.run_playerctl = fake
+        self.assertEqual(backend.volume(+1), 55)
+        self.assertEqual(calls[0], ("volume", "0.05+"))
+
+
 class TransportRetryTests(unittest.TestCase):
     """A button press has to survive the player changing underneath it."""
 
@@ -434,14 +748,15 @@ class StaleExtensionHintTests(unittest.TestCase):
         link.note_probe_gap()
         self.assertFalse(link._gap_noted)
 
-    def test_it_does_not_repeat_itself(self):
+    def test_it_says_it_once_not_on_every_poll(self):
+        # This used to reset the flag itself and then assert it had been set -
+        # it passed whatever the code did.
         link = self.link(5)
-        link.note_probe_gap()
-        link._gap_noted = False              # pretend the caller reset it
-        link.polls = 9
-        link.probe = None
-        link.note_probe_gap()                # second call sets it again, silently
-        self.assertTrue(link._gap_noted)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            link.note_probe_gap()
+            link.polls = 50
+            link.note_probe_gap()
+        self.assertEqual(out.getvalue().count("has never told us"), 1)
 
 
 class ShutdownHandlerTests(unittest.TestCase):
@@ -573,6 +888,107 @@ class DeviceTextTests(unittest.TestCase):
         self.assertEqual(title, b"alluminyum")
         self.assertEqual(artist, b"Broken Valentine")
         self.assertTrue(all(0x20 <= b < 0x7F for b in title + artist))
+
+
+class SessionChoiceTests(unittest.TestCase):
+    """Which Windows media session the bridge follows.
+
+    This logic used to live inside `if IS_WINDOWS:`, where nothing can import it
+    on Linux - so a regression here was only ever found by a Windows user, and it
+    shows up as the wrong track on the device.
+    """
+
+    PLAYING = 1
+
+    class FakeSession:
+        def __init__(self, aumid, playing=True):
+            self.source_app_user_model_id = aumid
+            self.playing = playing
+
+        def get_playback_info(self):
+            return types.SimpleNamespace(playback_status=1 if self.playing else 0)
+
+    def label(self, session):
+        return session.source_app_user_model_id
+
+    def is_playing(self, session):
+        return session.get_playback_info().playback_status == self.PLAYING
+
+    def test_a_pinned_player_wins_even_when_it_is_paused(self):
+        firefox = self.FakeSession("firefox", playing=False)
+        spotify = self.FakeSession("spotify", playing=True)
+        chosen = y.choose_session([spotify, firefox], "firefox", self.label, self.is_playing)
+        self.assertIs(chosen, firefox)
+
+    def test_a_pinned_player_that_is_not_running_does_not_fall_back(self):
+        chosen = y.choose_session([self.FakeSession("spotify")], "firefox",
+                                  self.label, self.is_playing)
+        self.assertIsNone(chosen)
+
+    def test_without_a_hint_the_playing_session_wins(self):
+        paused = self.FakeSession("vlc", playing=False)
+        playing = self.FakeSession("mpv", playing=True)
+        self.assertIs(y.choose_session([paused, playing], None, self.label, self.is_playing),
+                      playing)
+
+    def test_nothing_playing_still_shows_the_first(self):
+        only = self.FakeSession("vlc", playing=False)
+        self.assertIs(y.choose_session([only], None, self.label, self.is_playing), only)
+
+    def test_no_sessions_is_none(self):
+        self.assertIsNone(y.choose_session([], None, self.label, self.is_playing))
+
+
+class TimelineTrustTests(unittest.TestCase):
+    """Firefox's SMTC timeline is stale until it is seen to move.
+
+    Believing it straight away is what put the previous track's total, at
+    position zero, on the device.
+    """
+
+    def setUp(self):
+        self.guard = {"key": None, "pos": 0.0, "trusted": False}
+
+    def test_a_frozen_timeline_is_not_believed(self):
+        self.assertEqual(y.trusted_timeline(self.guard, "song", True, 0.0, 200), (0, 0))
+        self.assertEqual(y.trusted_timeline(self.guard, "song", True, 0.0, 200), (0, 0))
+
+    def test_it_is_believed_once_the_position_moves(self):
+        y.trusted_timeline(self.guard, "song", True, 0.0, 200)
+        self.assertEqual(y.trusted_timeline(self.guard, "song", True, 1.5, 200), (1, 200))
+
+    def test_a_new_track_drops_back_to_untrusted(self):
+        y.trusted_timeline(self.guard, "song", True, 0.0, 200)
+        y.trusted_timeline(self.guard, "song", True, 1.5, 200)
+        self.assertEqual(y.trusted_timeline(self.guard, "next", True, 0.0, 180), (0, 0))
+
+
+class CjkReadingTests(unittest.TestCase):
+    """Japanese/Chinese readings, when the optional dictionaries are installed.
+
+    They cannot be installed in CI, so a stub stands in for them: this pins the
+    branch itself (text -> reading -> '?'), which shipped with no test at all.
+    """
+
+    def tearDown(self):
+        y._OPTIONAL_MODULES.clear()
+
+    def test_kana_uses_the_japanese_reading(self):
+        y._OPTIONAL_MODULES["pykakasi"] = types.SimpleNamespace(
+            kakasi=lambda: types.SimpleNamespace(
+                convert=lambda text: [{"orig": c, "hepburn": "moshi"} for c in text]))
+        self.assertEqual(y.device_text("もし"), "moshimoshi")
+
+    def test_hanzi_uses_the_chinese_reading(self):
+        y._OPTIONAL_MODULES["pypinyin"] = types.SimpleNamespace(
+            lazy_pinyin=lambda text: ["bei", "jing"])
+        self.assertEqual(y.device_text("北京"), "bei jing")
+
+    def test_nothing_is_importable_says_nothing_changes(self):
+        # the real state on a default install: no dictionaries, so the caller
+        # marks the characters instead of guessing
+        y._OPTIONAL_MODULES["pykakasi"] = None
+        self.assertEqual(y.device_text("もし"), "??")
 
 
 if __name__ == "__main__":

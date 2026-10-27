@@ -98,7 +98,10 @@ function onState(p) {
   if (!prev || prev.title !== state.title || prev.artist !== state.artist) textDirty = true;
   if (!p.art || p.art !== lastArt) maybeSendArt(p.art);
   maybeSendLike(p.liked === null ? LIKE_UNKNOWN : (p.liked ? LIKE_YES : LIKE_NO));
-  if (typeof p.vol === "number" && p.vol !== lastVol) sendVol(p.vol);
+  /* The page's own slider, and it stays on screen when paused: it is still the
+   * volume the music will resume at. 255 only when there is no number at all. */
+  const vol = typeof p.vol === "number" ? p.vol : null;
+  if (vol !== lastVol) sendVol(vol);
   /* A press the page refused must not look like a dead button. `after` is only
    * present once the page has checked the result, so a pending ok:false (set
    * the instant the click is dispatched) does not cry wolf. */
@@ -114,10 +117,16 @@ function onState(p) {
 function frame(type, payload) {
   return Uint8Array.from([type, payload.length & 0xff, (payload.length >> 8) & 0xff, ...payload]);
 }
+/* pos/dur are clamped to 16 bits before packing, exactly like the Python host
+ * (ytm_bridge.meta_frame). Masking alone let the two hosts disagree above
+ * 65535, which the parity test cannot see. */
+const word = (value) => {
+  const n = Math.max(0, Math.min(65535, Math.trunc(value || 0)));
+  return [n & 0xff, (n >> 8) & 0xff];
+};
+
 function metaFrame(withText) {
-  const payload = [state.playing ? 1 : 0,
-                   state.pos & 0xff, (state.pos >> 8) & 0xff,
-                   state.dur & 0xff, (state.dur >> 8) & 0xff];
+  const payload = [state.playing ? 1 : 0, ...word(state.pos), ...word(state.dur)];
   if (withText) {
     payload.push(...enc(state.title || "", TITLE_MAX), 0, ...enc(state.artist || "", ARTIST_MAX), 0);
   }
@@ -127,7 +136,13 @@ const enc = (s, max) => Array.from(new TextEncoder().encode(s)).slice(0, max);
 
 function artFrame(w, h, bits) { return frame(FRAME_ART, [w, h, ...bits]); }
 function likeFrame(v) { return frame(FRAME_LIKE, [v]); }
-function volFrame(v) { return frame(FRAME_VOL, [v]); }
+/* 255 is "no volume to show": a paused player's slider is not the loudness in
+ * the room, and the device draws '--' for it. Mirrors ytm_bridge.vol_frame. */
+const VOL_UNKNOWN = 255;
+function volFrame(v) {
+  if (v === null || v === undefined) return frame(FRAME_VOL, [VOL_UNKNOWN]);
+  return frame(FRAME_VOL, [Math.max(0, Math.min(100, Math.trunc(v)))]);
+}
 /* One short line the device shows for a moment: icon 1 = heart, 2 = broken.
  * 23 text bytes, not 22: the Python host sends TOAST_MAX-1 and the two hosts
  * must agree byte for byte (tests/test_frames_js.py enforces it). */

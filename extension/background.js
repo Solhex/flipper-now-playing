@@ -188,7 +188,17 @@ chrome.runtime.onConnect.addListener((port) => {
       handleRemoteCommand(message.cmd, message.title, message.client);
     }
   });
-  port.onDisconnect.addListener(() => remotePorts.delete(port));
+  /* The link page is gone (tab closed, or it navigated away). Fall back to the
+   * loopback bridge if one is running: without this the worker stays in
+   * "bluetooth" mode for good, so it keeps reading the page and reports nothing -
+   * no heart, and a like falls back to the keyboard path. */
+  port.onDisconnect.addListener(() => {
+    remotePorts.delete(port);
+    if (remotePorts.size === 0 && mode === "bluetooth") {
+      mode = "bridge";
+      pollLoop();
+    }
+  });
 });
 
 /* What the extension can see about itself, sent to the bridge and printed there.
@@ -235,11 +245,14 @@ async function probeOnce() {
     out.tabs = `query failed: ${error.message}`;
   }
   try {
-    await fetch(`${BRIDGE}/diag`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(out),
-    });
+    /* Sent as a GET, not a POST: until the user grants this add-on its hosts
+     * (Firefox makes site access opt-in), the browser CORS-preflights every
+     * POST and the bridge deliberately answers no CORS - so a POST probe is
+     * blocked in exactly the state it exists to report, and the bridge is left
+     * guessing "old build" while the real fault is no site access. A GET with
+     * the payload in the query string is not preflighted. */
+    const probe = encodeURIComponent(JSON.stringify(out));
+    await fetch(`${BRIDGE}/diag?probe=${probe}`, { cache: "no-store" });
   } catch (error) {
     /* no bridge to hold it: the extension's own console is the only other reader */
   }
@@ -266,6 +279,10 @@ async function pollLoop() {
       if (data && data.cmd === "toggle") forwardToggle(data.title, data.client);
       else if (data && data.cmd === "activate") await activateClient(data.client);
       else if (data && data.cmd === "restore") await restorePreviousTab();
+      // Volume is the page's own slider: MPRIS's number does not match it, so
+      // the Flipper's keys have to move the slider the site shows.
+      else if (data && (data.cmd === "volup" || data.cmd === "voldown"))
+        handleRemoteCommand(data.cmd, data.title, data.client);
     } catch (error) {
       await new Promise((resolve) => setTimeout(resolve, RETRY_MS));
     }

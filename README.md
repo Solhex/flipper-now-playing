@@ -96,6 +96,14 @@ is a couple of clicks:
 Skip both and the bridge still runs - you lose the heart and a like becomes a
 blind keystroke, as the browser table below spells out.
 
+**After route 2, click the add-on's toolbar icon once.** Firefox makes an
+add-on's host access opt-in, so a freshly installed .xpi can poll the bridge and
+look healthy while it cannot read the page at all - no heart, and a like stays a
+blind keystroke. One click on the icon ("Grant site access (once)"), or the same
+sites switched on in `about:addons` -> the add-on -> Permissions, fixes it for
+good. Route 1 needs no click: a temporary add-on holds that access while it is
+loaded, which is why the two behave differently.
+
 **Start it at login.** Both platforms have an installer that sets the autostart
 up and starts it now, so this is the only step after `pip install`:
 
@@ -144,7 +152,7 @@ Korean, Japanese or Chinese title would reach the screen as blank space. The PC
 side converts it before it goes out: accents fold (`naive cafe`), Korean
 romanises (`alluminyum`), and anything still undrawable shows `?` instead of
 nothing. The bridge romanises Japanese and Chinese as well if you install the
-optional readings (`pip install pykakasi pypinyin`); the browser extension shows
+optional readings (`pip install -r requirements-cjk.txt`); the browser extension shows
 `?` for those, because it cannot carry the dictionaries. The device still gets
 the same frame either way.
 
@@ -165,6 +173,14 @@ loader refuses it ("too new"). Momentum's SDK is what's used above.
 
 One row per key and action, so a hold is its own line rather than sharing a cell
 with the tap. The same list is on the device: Settings -> Keys.
+
+**Which volume that is.** The app's own level in the mixer (Core Audio on
+Windows, the Firefox/PipeWire stream on Linux), not the site's slider: measured
+here, YouTube Music reported 10% while Firefox's stream sat at 110%, so the site
+slider cannot make the music quieter. The number on the screen and the Up/Down
+keys are that same mixer level, so they cannot disagree - and it works while
+paused. Above 100% (PipeWire allows it) the screen shows 100; the keys still step
+down.
 
 The screen shows the cover on the left, title/artist/state on the right, and a
 progress bar with elapsed/total underneath. Long titles scroll. An unknown
@@ -284,8 +300,6 @@ disagree with the device.
 
 **Handy extras**
 
-- Timer check (the elapsed time is estimated on Firefox, which reports no
-  position): `python3 ~/.local/share/ytm-remote/check_time.py [--watch 20]`
 - Test with no music playing: run a fake MPRIS player, then
   `ytm_bridge.py --player faketest --name Gumi`
   (`templates/fake-mpris-player.py` in the `flipper-zero-app-dev` skill).

@@ -60,6 +60,8 @@ class FrameParityTests(unittest.TestCase):
         self.assertParity("like_yes", y.like_frame(1))
         self.assertParity("like_unknown", y.like_frame(2))
         self.assertParity("vol", y.vol_frame(100))
+        self.assertParity("vol_clamped", y.vol_frame(140))
+        self.assertParity("vol_unknown", y.vol_frame(None))
         self.assertParity("toast", y.toast_frame("Liked", 1))
 
     def test_art_envelope_packs_bits_lsb_first(self):
@@ -70,6 +72,12 @@ class FrameParityTests(unittest.TestCase):
         meta = {"playing": False, "pos": 0, "dur": 0,
                 "title": "x" * 200, "artist": "y" * 200}
         self.assertParity("meta_truncated", y.meta_frame(meta, with_text=True))
+
+    def test_positions_past_16_bits_clamp_the_same_way(self):
+        # Nothing caps the clock for a stream with no length, and to_bytes raises
+        # above 65535 - so both hosts clamp instead of packing a wrapped value.
+        meta = {"playing": True, "pos": 70000, "dur": 999999, "title": "x", "artist": "y"}
+        self.assertParity("meta_clamped", y.meta_frame(meta, with_text=False))
 
     def test_multibyte_text_splits_the_same_way(self):
         meta = {"playing": True, "pos": 5, "dur": 9, "title": "é" * 40, "artist": ""}

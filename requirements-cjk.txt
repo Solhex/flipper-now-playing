@@ -1,0 +1,12 @@
+# Optional readings for Japanese and Chinese titles.
+#
+# The Flipper's fonts are Latin-only, so ytm_bridge device_text() romanises what
+# it can and marks the rest with '?'. Korean needs nothing (Hangul decomposes
+# mechanically); these two dictionaries cover the scripts that need readings.
+#
+#   pip install -r requirements-cjk.txt
+#
+# Without them Japanese and Chinese titles show '?' instead of blank space. The
+# browser extension always marks them, because it cannot carry the dictionaries.
+pykakasi
+pypinyin

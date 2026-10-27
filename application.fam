@@ -7,7 +7,7 @@ App(
     entry_point="ytm_remote_app",
     stack_size=4 * 1024,
     fap_category="Bluetooth",
-    fap_version="1.0",
+    fap_version="1.1",
     fap_icon="ytm_remote.png",  # 10x10 1-bit PNG
     fap_description="Show and control YouTube Music on your PC over Bluetooth",
     fap_author="fvern",

@@ -37,6 +37,7 @@
 
   let seen = 0;              // toggles that actually reached this tab
   let lastReject = null;     // ...and why one was ignored, if it was
+  let lastVolNudge = null;   // what the last volume press actually moved
   let lastActive = Date.now();
   let lastSent = "";
   let lastActivityReport = 0;
@@ -64,11 +65,57 @@
   };
 
   const isPlaying = () => {
-    const video = document.querySelector("video");
+    const video = videoEl();
     return video ? !video.paused && !video.ended : null;
   };
 
-  const videoEl = () => document.querySelector("video");
+  /* The page can hold several <video> elements (an ad slot, a preloaded next
+   * track), and the first in the DOM is not always the one making sound. Reading
+   * the wrong one put another element's volume on the Flipper while the site's
+   * own bar said something else - three numbers, one player. */
+  const videoEl = () => {
+    const all = [...document.querySelectorAll("video")];
+    return all.find((v) => !v.paused && !v.ended)
+        || all.find((v) => v.currentTime > 0)
+        || all[0] || null;
+  };
+
+  /* The media element's volume, which is the loudness YouTube Music applies -
+   * and the only volume a content script can both read and write. The site's
+   * own bar is not: measured, it has no `value` property (its track lives in a
+   * shadow root, so clicks on the host never reach it) and it disagrees with the
+   * element anyway (one page, one <video>: bar 20%, element 4%; at the bar's top
+   * the element stops at 86%). So one number is shown and one control is moved,
+   * and they are the same one. */
+  const volumePercent = () => {
+    const v = videoEl();
+    return v && isFinite(v.volume) ? Math.round(v.volume * 100) : null;
+  };
+
+  /* The site's bar: readable, not writable (see volumePercent). Only the diag
+   * uses it, so a disagreement between the bar and the element stays visible. */
+  const volumeBar = () => document.querySelector("#volume-slider");
+
+  /* The site's bar value, kept only for diagnostics: it is read-only for us. */
+  const barNow = () => {
+    const bar = volumeBar();
+    const now = bar && parseInt(bar.getAttribute("aria-valuenow"), 10);
+    return Number.isFinite(now) ? now : null;
+  };
+
+  /* Which element we use, and what the bar says - so a disagreement between the
+   * two can be read from the bridge instead of guessed at. */
+  const volumeDiag = () => {
+    const videos = [...document.querySelectorAll("video")].slice(0, 4).map((v, i) => ({
+      i, vol: Math.round(v.volume * 100), muted: v.muted, paused: v.paused,
+      time: Math.round(v.currentTime), h: v.videoHeight,
+    }));
+    const bar = document.querySelector("#volume-slider");
+    return {
+      videos,
+      bar: bar ? { now: bar.getAttribute("aria-valuenow"), value: bar.value ?? null } : null,
+    };
+  };
 
   /* The cover the player is showing. Media Session metadata names the track's own
    * artwork; the player-bar image is the fallback for the moments before the
@@ -90,11 +137,12 @@
    * desktop API, which is why this runs here rather than on the PC. */
   const progress = () => {
     const v = videoEl();
-    if (!v) return { pos: 0, dur: 0, vol: 100 };
+    const vol = volumePercent();
+    if (!v) return { pos: 0, dur: 0, vol };
     return {
       pos: isFinite(v.currentTime) ? Math.floor(v.currentTime) : 0,
       dur: isFinite(v.duration) ? Math.floor(v.duration) : 0,
-      vol: Math.round((isFinite(v.volume) ? v.volume : 1) * 100),
+      vol,
     };
   };
 
@@ -114,7 +162,7 @@
       /* Proof of what the last click did - "the button is not there" and "the
        * click changed nothing" are indistinguishable from the bridge otherwise. */
       diag: { button: !!button(), renderers: renderers(), click: lastClick,
-              seen, reject: lastReject },
+              seen, reject: lastReject, vol: volumeDiag(), nudge: lastVolNudge },
     };
   }
 
@@ -230,8 +278,23 @@
        * device and the buttons in the player agree. */
       case "seekback": if (v && isFinite(v.currentTime)) v.currentTime = Math.max(0, v.currentTime - 5); break;
       case "seekfwd": if (v && isFinite(v.duration)) v.currentTime = Math.min(v.duration, v.currentTime + 5); break;
-      case "volup": if (v) v.volume = Math.min(1, v.volume + 0.05); break;
-      case "voldown": if (v) v.volume = Math.max(0, v.volume - 0.05); break;
+      /* The element's volume (see volumePercent): it changes the loudness even
+       * while paused, which a page-level control cannot promise. The site's bar
+       * is left where it is - it cannot be written from here - so it may read a
+       * little behind until it is touched, and diag.vol.nudge shows both. */
+      case "volup":
+      case "voldown": {
+        const delta = kind === "volup" ? 5 : -5;
+        const ve = videoEl();
+        if (ve) {
+          ve.volume = Math.max(0, Math.min(1, ve.volume + delta / 100));
+          lastVolNudge = { element: Math.round(ve.volume * 100), bar: barNow(),
+                           at: Date.now() };
+        } else {
+          lastVolNudge = { element: null, bar: barNow(), why: "no video element" };
+        }
+        break;
+      }
       default: break;
     }
     setTimeout(() => report(true), 250);   // the new state goes out at once
