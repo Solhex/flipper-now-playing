@@ -217,6 +217,7 @@ class BrowserLink:
         self.requests = 0           # how many reports arrived since start
         self.changes = 0            # how many times "liked" actually changed
         self.probe = None           # last /diag payload: what the extension sees
+        self._gap_noted = False     # said "this extension is an old build" yet?
         self.polls = 0              # long-poll requests: proof the extension listens
         self._commands = queue.Queue()
         self._lock = threading.Lock()
@@ -330,6 +331,22 @@ class BrowserLink:
         with self._lock:
             self.probe = probe
         print("  <- extension probe:", json.dumps(probe, ensure_ascii=False))
+
+    def note_probe_gap(self):
+        """Say once, loudly, when an extension is talking but never reporting.
+
+        A build older than the probe polls for commands exactly like a current
+        one, so the only outward sign of a stale copy is the silence - and that
+        silence is what makes "the page never reports" unattributable. This names
+        the fix instead of leaving someone to guess.
+        """
+        with self._lock:
+            if self.probe is not None or self.polls < 3 or self._gap_noted:
+                return
+            self._gap_noted = True
+        print("  .. an extension is polling but has never sent a probe: it is an "
+              "old build. Reload it from extension/dist/firefox (about:debugging), "
+              "and remove any installed copy sharing the same id.")
 
     def request_toggle(self, title="", client=None, worker=""):
         if not worker:
@@ -452,6 +469,7 @@ class BrowserLink:
                 if self.path.startswith("/wait"):
                     with link._lock:
                         link.polls += 1
+                    link.note_probe_gap()
                     query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                     worker = query.get("worker", [""])[0]
                     browser = query.get("browser", [""])[0]

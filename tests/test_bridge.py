@@ -410,6 +410,40 @@ class TransportRetryTests(unittest.TestCase):
         self.assertEqual(len(calls), 1)
 
 
+class StaleExtensionHintTests(unittest.TestCase):
+    """An old extension polls exactly like a current one; only silence differs."""
+
+    def link(self, polls, probe=None):
+        link = y.BrowserLink(59999)          # never started: state only
+        link.polls = polls
+        link.probe = probe
+        return link
+
+    def test_a_polling_but_silent_extension_is_called_out(self):
+        link = self.link(5)
+        link.note_probe_gap()
+        self.assertTrue(link._gap_noted)
+
+    def test_a_current_extension_is_not_called_out(self):
+        link = self.link(5, probe={"version": "2.0.0"})
+        link.note_probe_gap()
+        self.assertFalse(link._gap_noted)
+
+    def test_it_waits_for_a_few_polls_before_judging(self):
+        link = self.link(1)
+        link.note_probe_gap()
+        self.assertFalse(link._gap_noted)
+
+    def test_it_does_not_repeat_itself(self):
+        link = self.link(5)
+        link.note_probe_gap()
+        link._gap_noted = False              # pretend the caller reset it
+        link.polls = 9
+        link.probe = None
+        link.note_probe_gap()                # second call sets it again, silently
+        self.assertTrue(link._gap_noted)
+
+
 class ShutdownHandlerTests(unittest.TestCase):
     def test_sigterm_unwinds_instead_of_killing_the_process(self):
         # systemd stops the bridge with SIGTERM, and Python's default for that
