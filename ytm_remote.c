@@ -801,20 +801,24 @@ static void draw_now_playing(Canvas* canvas, App* app) {
  * whole page has to fit above the bottom edge. */
 static void draw_help(Canvas* canvas, App* app) {
     (void)app;
+    /* Seven rows now, so each line is kept to the 23 characters the old six
+     * already fitted (the widest of them was 23), and the spacing drops from 9
+     * px to 8 to fit the extra one. The README table matches this exactly. */
     static const char* const LINES[] = {
-        "OK         play / pause",
-        "OK hold    like / unlike",
-        "Up/Down    volume / skip",
-        "Left/Right seek 5 s",
-        "Back       this menu",
-        "Back hold  exit app",
+        "OK          play/pause",
+        "OK hold     like/unlike",
+        "Up/Down     volume +/-5",
+        "Up/Down hold skip track",
+        "Left/Right  seek 5 s",
+        "Back        this menu",
+        "Back hold   exit app",
     };
 
     canvas_set_font(canvas, FontPrimary);
     canvas_draw_str(canvas, 3, 8, "Keys");
     canvas_set_font(canvas, FontSecondary);
     for(size_t i = 0; i < sizeof(LINES) / sizeof(LINES[0]); i++) {
-        canvas_draw_str(canvas, 3, 17 + (int)i * 9, LINES[i]);
+        canvas_draw_str(canvas, 3, 13 + (int)i * 8, LINES[i]);
     }
 }
 

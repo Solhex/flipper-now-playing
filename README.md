@@ -130,11 +130,15 @@ loader refuses it ("too new"). Momentum's SDK is what's used above.
 | Key | Action |
 |---|---|
 | OK | play / pause |
-| **OK (hold)** | like / unlike |
-| Up / Down | tap: volume +/-5 % - hold (~0.3 s): next / previous track |
-| Left / Right | seek -/+5 s (what YouTube Music's own seek controls do) |
-| Back (short) | settings menu (backlight, stay-on, key list, exit) |
+| OK (hold) | like / unlike |
+| Up / Down | volume +/-5 % |
+| Up / Down (hold) | next / previous track |
+| Left / Right | seek -5 s / +5 s (what YouTube Music's own seek controls do) |
+| Back | settings menu (backlight, stay-on, key list, exit) |
 | Back (hold) | exit the app |
+
+One row per key and action, so a hold is its own line rather than sharing a cell
+with the tap. The same list is on the device: Settings -> Keys.
 
 The screen shows the cover on the left, title/artist/state on the right, and a
 progress bar with elapsed/total underneath. Long titles scroll. An unknown
