@@ -867,6 +867,15 @@ class MprisBackend:
         if not args:
             return
         ok, _ = self.run_playerctl(*args)
+        if not ok:
+            # Seen in the wild: play/pause failing three presses in a row, then
+            # working. Firefox tears down and rebuilds its media session on every
+            # track change, and playerctl refuses while it is between the two -
+            # the press itself is still wanted, so one retry a moment later
+            # catches it. Exactly one: a genuinely dead player must not turn the
+            # button into a retry loop.
+            await asyncio.sleep(0.2)
+            ok, _ = self.run_playerctl(*args)
         if ok:
             print(f"  <- command {ch!r} -> playerctl {' '.join(args)}")
         else:

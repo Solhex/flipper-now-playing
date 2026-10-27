@@ -377,6 +377,38 @@ class BrowserLinkTests(unittest.TestCase):
             self.assertIn("error", json.load(reply)["probe"])
 
 
+class TransportRetryTests(unittest.TestCase):
+    """A button press has to survive the player changing underneath it."""
+
+    def backend(self, outcomes):
+        backend = y.MprisBackend("firefox")
+        calls = []
+
+        def fake(*args):
+            calls.append(args)
+            return outcomes[min(len(calls) - 1, len(outcomes) - 1)], ""
+
+        backend.run_playerctl = fake
+        return backend, calls
+
+    def test_a_quick_failure_is_retried_once(self):
+        # playerctl refuses while Firefox rebuilds its media session between two
+        # tracks, which is what made play/pause look broken for three presses.
+        backend, calls = self.backend([False, True])
+        asyncio.run(backend.command("p"))
+        self.assertEqual(len(calls), 2)
+
+    def test_a_dead_player_is_tried_twice_and_then_left_alone(self):
+        backend, calls = self.backend([False])
+        asyncio.run(backend.command("p"))
+        self.assertEqual(len(calls), 2)
+
+    def test_a_press_that_works_is_not_repeated(self):
+        backend, calls = self.backend([True])
+        asyncio.run(backend.command("p"))
+        self.assertEqual(len(calls), 1)
+
+
 class DeviceTextTests(unittest.TestCase):
     """Titles the Flipper cannot draw are converted on the way out, not left blank.
 
