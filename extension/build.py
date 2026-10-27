@@ -33,6 +33,12 @@ def build_manifest(base, target):
 
     if target == "firefox":
         manifest["background"] = {"scripts": ["background.js"]}
+        # Firefox has no Web Bluetooth, so it needs the Python bridge: the
+        # Chromium wording ("no companion app to install") is simply untrue
+        # here, and it is the text the add-ons list and the install prompt show.
+        manifest["description"] = (
+            "Show YouTube Music's now-playing on a Flipper Zero and control "
+            "playback. Firefox needs the companion bridge too - see the README.")
         # Firefox has no Web Bluetooth: the permission would only produce an
         # "unknown permission" warning, the Web Bluetooth link page could never
         # work, and a toolbar button opening it would only say so. Ship none of
