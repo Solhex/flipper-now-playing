@@ -179,7 +179,7 @@ class MprisParsingTests(unittest.TestCase):
             return True, line
 
         backend.run_playerctl = fake
-        backend.stream = lambda force=False: (None, None)   # no mixer in a test
+        backend.stream = lambda force=False, running_only=False: (None, None)   # no mixer in a test
         return backend
 
     def test_the_mixer_level_wins_over_mpris(self):
@@ -188,7 +188,7 @@ class MprisParsingTests(unittest.TestCase):
         line = "Playing\t0\t0\tSong\tArtist\t\t\t0.42\n"
         backend = y.MprisBackend("firefox")
         backend.run_playerctl = lambda *_a: (True, line)
-        backend.stream = lambda force=False: (414, 35)
+        backend.stream = lambda force=False, running_only=False: (414, 35)
         meta = asyncio.run(backend.read())
         assert meta is not None
         self.assertEqual(meta["vol"], 35)
@@ -574,7 +574,7 @@ class SinkInputParseTests(unittest.TestCase):
         finally:
             y.pactl_streams = original
 
-    def test_a_corked_stream_is_better_than_none(self):
+    def test_a_corked_stream_is_better_than_none_when_paused(self):
         # Paused: every stream may be corked, and its level is still the one the
         # music resumes at.
         backend = y.MprisBackend("firefox.instance_1_44")
@@ -584,6 +584,38 @@ class SinkInputParseTests(unittest.TestCase):
             self.assertEqual(backend.stream(force=True), (414, 100))
         finally:
             y.pactl_streams = original
+
+    def test_a_corked_stream_does_not_count_while_playing(self):
+        # A track change tears the running stream down; the corked leftovers must
+        # not answer for it, or the device shows their old level (95%) for a
+        # second on every song change.
+        backend = y.MprisBackend("firefox.instance_1_44")
+        original = y.pactl_streams
+        y.pactl_streams = lambda: y.parse_streams(
+            "Sink Input #414\n"
+            "\tCorked: yes\n"
+            "\tVolume: front-left: 1 /  95% / x\n"
+            "\t\tapplication.name = \"Firefox\"\n")
+        try:
+            self.assertEqual(backend.stream(force=True, running_only=True), (None, None))
+            self.assertEqual(backend.stream(force=True), (414, 95))
+        finally:
+            y.pactl_streams = original
+
+    def test_a_missing_stream_holds_the_last_level(self):
+        # The number must not jump to another source while the stream is rebuilt.
+        line = "Playing\t0\t0\tSong\tArtist\t\t\t0.42\n"
+        backend = y.MprisBackend("firefox")
+        backend.run_playerctl = lambda *_a: (True, line)
+        answers = [(414, 35), (None, None)]
+        backend.stream = lambda force=False, running_only=False: answers.pop(0)
+        first = asyncio.run(backend.read())
+        assert first is not None
+        self.assertEqual(first["vol"], 35)
+        backend.stream = lambda force=False, running_only=False: (None, None)
+        second = asyncio.run(backend.read())
+        assert second is not None
+        self.assertEqual(second["vol"], 35)   # held, not the player's 42
 
 
 class LinkVolumeTests(unittest.TestCase):
@@ -643,7 +675,7 @@ class LinkVolumeTests(unittest.TestCase):
         line = "Playing\t0\t0\tSong\tArtist\t\t\t0.9\n"
         backend = y.MprisBackend("firefox", self.link)
         backend.run_playerctl = lambda *_a: (True, line)
-        backend.stream = lambda force=False: (None, None)
+        backend.stream = lambda force=False, running_only=False: (None, None)
         meta = asyncio.run(backend.read())
         assert meta is not None
         self.assertEqual(meta["vol"], 30)      # the page, not MPRIS's 90
@@ -663,12 +695,12 @@ class LinkVolumeTests(unittest.TestCase):
         self.post(30)
         backend = y.MprisBackend("firefox", self.link)
         backend.run_playerctl = lambda *_a: (True, "0.55\n")
-        backend.stream = lambda force=False: (None, None)
+        backend.stream = lambda force=False, running_only=False: (None, None)
         self.assertEqual(backend.volume(+1), 30)
 
     def test_the_key_moves_the_mixer_stream(self):
         backend = y.MprisBackend("firefox")
-        backend.stream = lambda force=False: (414, 100)
+        backend.stream = lambda force=False, running_only=False: (414, 100)
         calls = []
         original = y.subprocess.run
         y.subprocess.run = lambda args, **kw: calls.append(args) or types.SimpleNamespace(returncode=0)
@@ -680,7 +712,7 @@ class LinkVolumeTests(unittest.TestCase):
 
     def test_without_a_page_or_mixer_the_volume_keys_still_work(self):
         backend = y.MprisBackend("firefox", None)
-        backend.stream = lambda force=False: (None, None)
+        backend.stream = lambda force=False, running_only=False: (None, None)
         calls = []
 
         def fake(*args):

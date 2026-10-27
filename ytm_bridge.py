@@ -1034,7 +1034,9 @@ class MprisBackend:
         self._liked_at = 0.0
         self._liked_task = None
         self._refollow_at = 0.0
-        self._stream_cache = (0.0, None, None)   # (when, sink-input index, percent)
+        self._stream_cache = (0.0, False, None, None)   # (when, running_only, index, %)
+        self._last_mixer = None     # last level the mixer gave us; held while a
+                                    # track change rebuilds the stream
 
     # ---- helpers shared with the old module-level API
     def run_playerctl(self, *args):
@@ -1085,6 +1087,9 @@ class MprisBackend:
         app = previous.split(".instance")[0]
         same_app = [p for p in players if app and p.startswith(app)]
         self.player = (same_app or players)[0]
+        # A different player means a different stream: do not carry its level over.
+        self._stream_cache = (0.0, False, None, None)
+        self._last_mixer = None
         print(f"  .. player {previous!r} went away; following {self.player!r}")
 
     async def read(self):
@@ -1129,12 +1134,17 @@ class MprisBackend:
         # Kept for the like path: the click is aimed at the tab playing this
         # track, and _liked_state only fills this in when the debug port is used.
         self._title = (f["xesam:title"] or "").strip()
-        # One number, in the order of what actually decides the loudness: this
-        # app's mixer stream, else the page's own volume (a host with no mixer
-        # we can reach), else what the player itself claims.
-        _, level = self.stream()
+        # One number, from one source: this app's mixer stream. While a track is
+        # changing there is no running stream for a moment, and then the last
+        # known level is held - not another source's number, which is what made
+        # the volume jump to 95% and back on every song change.
+        _, level = self.stream(running_only=playing)
+        if level is not None:
+            self._last_mixer = level
+        else:
+            level = self._last_mixer
         if level is None and self.link is not None and self.link.fresh():
-            level = self.link.volume
+            level = self.link.volume          # a host with no mixer we can reach
         if level is None:
             level = pct(f["volume"])
         return {
@@ -1201,25 +1211,30 @@ class MprisBackend:
         else:
             print(f"  !! command {ch!r} failed: playerctl {' '.join(args)}")
 
-    def stream(self, force=False):
+    def stream(self, force=False, running_only=False):
         """This player's audio stream in the mixer: (index, percent) or (None, None).
+
+        Two things this has to get right, both measured on this box:
+        - Firefox leaves a *corked* stream behind for every finished track, at
+          whatever level it had. Moving that one changes the Flipper's number and
+          nothing else, so the running stream wins.
+        - A track change removes the running stream for a beat, and reporting the
+          corked one instead put 95% on the screen for a second every time the
+          song changed. So when only silence is left, say so (None) rather than
+          answer with a stale stream; the newest index is the current one.
 
         Cached for a moment: the poll runs at 20 Hz and this shells out to pactl.
         """
-        since, index, percent = self._stream_cache
-        if not force and time.monotonic() - since < 0.5:
+        since, cached_running, index, percent = self._stream_cache
+        if not force and cached_running == running_only and time.monotonic() - since < 0.5:
             return index, percent
         app = (self.player or "").split(".instance")[0].lower()
-        found = (None, None)
         matches = [s for s in pactl_streams() if app and app in s[1].lower()]
-        # The stream that is actually running, not merely the first: Firefox can
-        # own two, and the corked one is silent - moving it changed the Flipper's
-        # number while the music stayed exactly as loud.
-        running = [s for s in matches if not s[3]]
-        chosen = running or matches
-        if chosen:
-            found = (chosen[0][0], chosen[0][2])
-        self._stream_cache = (time.monotonic(), *found)
+        if running_only:
+            matches = [s for s in matches if not s[3]]
+        chosen = max(matches, key=lambda s: s[0]) if matches else None
+        found = (chosen[0], chosen[2]) if chosen else (None, None)
+        self._stream_cache = (time.monotonic(), running_only, *found)
         return found
 
     def volume(self, sign):
@@ -1230,7 +1245,11 @@ class MprisBackend:
         music quieter. This is also the layer Windows already used (Core Audio),
         and it works while paused.
         """
-        index, _ = self.stream(force=True)
+        # The running stream while the music plays; while paused there is none,
+        # and the corked one is the level it will resume at.
+        index, _ = self.stream(force=True, running_only=True)
+        if index is None:
+            index, _ = self.stream(force=True)
         if index is not None:
             step = f"{'+' if sign > 0 else '-'}{VOLUME_STEP * 100:.0f}%"
             subprocess.run(["pactl", "set-sink-input-volume", str(index), step],
