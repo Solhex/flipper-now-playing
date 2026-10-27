@@ -214,6 +214,7 @@ class BrowserLink:
         self.updated = 0.0          # monotonic, when /state last arrived
         self.requests = 0           # how many reports arrived since start
         self.changes = 0            # how many times "liked" actually changed
+        self.probe = None           # last /diag payload: what the extension sees
         self.polls = 0              # long-poll requests: proof the extension listens
         self._commands = queue.Queue()
         self._lock = threading.Lock()
@@ -312,10 +313,22 @@ class BrowserLink:
                     "changes": self.changes, "polls": self.polls,
                     "clients": len(self.clients), "client": self.active_id,
                     "focused": record.get("focused"), "visible": record.get("visible"),
-                    "diag": record.get("diag"),
+                    "diag": record.get("diag"), "probe": self.probe,
                     "fresh": self._select() is not None}
 
     # ---- commands
+    def set_probe(self, probe):
+        """Record what the extension could see about itself, and say it aloud.
+
+        The point of this path: when a page never reports, the useful facts
+        (does it have site access? can it see the tab? what did the browser say
+        when it tried to inject?) exist only inside the browser. Printing them
+        here puts them in the one place that can be read afterwards.
+        """
+        with self._lock:
+            self.probe = probe
+        print("  <- extension probe:", json.dumps(probe, ensure_ascii=False))
+
     def request_toggle(self, title="", client=None, worker=""):
         if not worker:
             target = client or self.active_id
@@ -390,6 +403,19 @@ class BrowserLink:
             def do_POST(self):
                 length = int(self.headers.get("Content-Length") or 0)
                 body = self.rfile.read(length) if length else b"{}"
+                if self.path.startswith("/diag"):
+                    # What the extension can see from inside itself: site access,
+                    # which YouTube Music tabs it can find, and what the browser
+                    # says when it tries to inject the content script. There is
+                    # no way to ask a user's browser these questions from here,
+                    # and "the page never reports" is otherwise unattributable.
+                    try:
+                        probe = json.loads(body or b"{}")
+                    except ValueError:
+                        probe = {"error": "unparseable probe"}
+                    link.set_probe(probe)
+                    self._reply(200, b'{"ok":true}')
+                    return
                 if self.path.startswith("/toggle"):
                     # Test hook: the same command the Flipper's like button sends,
                     # so the round trip can be checked with curl and no hardware.

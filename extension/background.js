@@ -177,6 +177,60 @@ chrome.runtime.onConnect.addListener((port) => {
   port.onDisconnect.addListener(() => remotePorts.delete(port));
 });
 
+/* What the extension can see about itself, sent to the bridge and printed there.
+ *
+ * Added after an afternoon spent guessing why a page never reported: from the
+ * bridge everything looked healthy (the background was polling, even taking
+ * commands) while nothing arrived from any tab. The facts that matter - site
+ * access granted? which YouTube Music tabs are visible? what does the browser
+ * say when asked to inject? - only exist inside the browser, and the browser
+ * will not answer from the outside. So it answers itself, on a timer, into the
+ * log. Injecting the content script is part of the probe, which also heals a tab
+ * whose script went missing. */
+async function probeOnce() {
+  const site = "https://music.youtube.com/*";
+  const out = { version: chrome.runtime.getManifest().version, mode, siteAccess: null,
+                bridge: null, tabs: [], inject: null };
+  try {
+    out.siteAccess = await chrome.permissions.contains({ origins: [site] });
+  } catch (error) {
+    out.siteAccess = `error: ${error.message}`;
+  }
+  try {
+    const reply = await fetch(`${BRIDGE}/state`, { cache: "no-store" });
+    out.bridge = String(reply.status);
+  } catch (error) {
+    out.bridge = `unreachable: ${error.message}`;
+  }
+  try {
+    const tabs = await chrome.tabs.query({ url: [site] });
+    out.tabs = tabs.map((tab) => ({ id: tab.id, discarded: !!tab.discarded, status: tab.status }));
+    const target = tabs.find((tab) => !tab.discarded) || tabs[0];
+    if (!target) {
+      out.inject = "no tab";
+    } else {
+      try {
+        await chrome.scripting.executeScript({ target: { tabId: target.id }, files: ["content.js"] });
+        injectedTabs.add(target.id);
+        out.inject = "ok";
+      } catch (error) {
+        out.inject = `failed: ${error.message}`;
+      }
+    }
+  } catch (error) {
+    out.tabs = `query failed: ${error.message}`;
+  }
+  try {
+    await fetch(`${BRIDGE}/diag`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(out),
+    });
+  } catch (error) {
+    /* no bridge to hold it: the extension's own console is the only other reader */
+  }
+}
+
 async function pollLoop() {
   if (polling) return;
   polling = true;
@@ -247,6 +301,10 @@ chrome.runtime.onInstalled.addListener(pollLoop);
  * alarm wakes the worker so the poll restarts; without it the bridge queues like
  * commands that nobody ever picks up. */
 chrome.alarms.create("keep-polling", { periodInMinutes: 0.5 });
-chrome.alarms.onAlarm.addListener(() => pollLoop());
+chrome.alarms.onAlarm.addListener(() => {
+  probeOnce();
+  pollLoop();
+});
 
+probeOnce();
 pollLoop();

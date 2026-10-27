@@ -355,6 +355,27 @@ class BrowserLinkTests(unittest.TestCase):
         self.assertTrue(helper.liked)
         helper.close()
 
+    def test_the_extension_probe_is_kept_and_exposed(self):
+        # The bridge has no other way to learn what the browser can see: the
+        # probe is what makes "the page never reports" attributable.
+        probe = {"siteAccess": False, "tabs": [{"id": 7, "discarded": False}],
+                 "inject": "failed: no permission", "mode": "bridge"}
+        request = urllib.request.Request(
+            f"{self.base}/diag", data=json.dumps(probe).encode(), method="POST",
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(request, timeout=5) as reply:
+            self.assertTrue(json.load(reply)["ok"])
+        with urllib.request.urlopen(f"{self.base}/state", timeout=5) as reply:
+            self.assertEqual(json.load(reply)["probe"], probe)
+
+    def test_a_junk_probe_does_not_take_the_link_down(self):
+        request = urllib.request.Request(
+            f"{self.base}/diag", data=b"not json", method="POST")
+        with urllib.request.urlopen(request, timeout=5) as reply:
+            self.assertTrue(json.load(reply)["ok"])
+        with urllib.request.urlopen(f"{self.base}/state", timeout=5) as reply:
+            self.assertIn("error", json.load(reply)["probe"])
+
 
 class DeviceTextTests(unittest.TestCase):
     """Titles the Flipper cannot draw are converted on the way out, not left blank.
