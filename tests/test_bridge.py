@@ -193,6 +193,23 @@ class MprisParsingTests(unittest.TestCase):
         assert meta is not None
         self.assertEqual(meta["vol"], 35)
 
+    def test_a_missing_playerctl_does_not_end_the_program(self):
+        # It used to sys.exit() from list(), which the poll loop reaches through
+        # _refollow(): a bridge whose playerctl went away killed itself, and on a
+        # machine without playerctl (the CI runner) every read() died with it.
+        backend = y.MprisBackend("firefox")
+        original = y.subprocess.run
+
+        def missing(*_args, **_kwargs):
+            raise FileNotFoundError("playerctl")
+
+        y.subprocess.run = missing
+        try:
+            self.assertEqual(backend.list(), [])
+            self.assertTrue(backend.missing_playerctl)
+        finally:
+            y.subprocess.run = original
+
     def test_metadata_line_is_parsed(self):
         line = ("Playing\t42000000\t215000000\tSong\tArtist\t"
                 "file:///tmp/cover.png\t/data/x.opus\t0.42\n")

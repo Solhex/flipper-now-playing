@@ -1034,6 +1034,7 @@ class MprisBackend:
         self._liked_at = 0.0
         self._liked_task = None
         self._refollow_at = 0.0
+        self.missing_playerctl = False   # said why the player list is empty yet?
         self._stream_cache = (0.0, False, None, None)   # (when, running_only, index, %)
         self._last_mixer = None     # last level the mixer gave us; held while a
                                     # track change rebuilds the stream
@@ -1051,10 +1052,19 @@ class MprisBackend:
         return out.returncode == 0, out.stdout
 
     def list(self):
+        """MPRIS player names, or [] when playerctl is not installed.
+
+        Never exit from in here: the poll loop reaches this through _refollow(),
+        so a missing playerctl killed a running bridge outright - and it took the
+        whole test suite with it wherever the tool is absent (the CI runner).
+        """
         try:
             out = subprocess.run(["playerctl", "-l"], capture_output=True, text=True)
         except FileNotFoundError:
-            sys.exit("playerctl not found - install it to read the media session")
+            if not self.missing_playerctl:
+                self.missing_playerctl = True
+                print("playerctl not found - install it to read the media session")
+            return []
         return [p for p in out.stdout.splitlines() if p.strip()]
 
     def close(self):
@@ -3082,6 +3092,8 @@ async def main_async(args):
                 time.sleep(5)
                 players = mpris.list()
             if not players:
+                if mpris.missing_playerctl:
+                    sys.exit("playerctl not found - install it to read the media session")
                 sys.exit("No MPRIS players found - start YouTube Music / a video first.")
             player = players[0]
             print("Using player:", player)
