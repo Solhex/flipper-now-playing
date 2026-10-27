@@ -97,13 +97,27 @@ async function ensureScript(tabId) {
   }
 }
 
-async function sweepTabs() {
+async function sweepTabs(force) {
   try {
     const tabs = await chrome.tabs.query({ url: ["https://music.youtube.com/*"] });
     for (const tab of tabs) {
-      if (!tab.discarded) ensureScript(tab.id);
+      if (tab.discarded) continue;
+      if (force) injectedTabs.delete(tab.id);
+      ensureScript(tab.id);
     }
   } catch (error) { /* no tabs permission for a URL match: ignore */ }
+}
+
+/* A tab that navigates gets a fresh document and a fresh content script. A tab
+ * that is merely reloaded while the add-on itself is being reloaded gets neither
+ * - and because the background had it down as "already injected", it was never
+ * repaired either: the page just stopped reporting, forever, with nothing
+ * anywhere to say why. Forget a tab the moment it starts loading, so the next
+ * sweep puts the script back. */
+if (chrome.tabs && chrome.tabs.onUpdated) {
+  chrome.tabs.onUpdated.addListener((tabId, info) => {
+    if (info.status === "loading") injectedTabs.delete(tabId);
+  });
 }
 
 function rankedTabs() {
@@ -236,6 +250,9 @@ async function pollLoop() {
   polling = true;
   sweepTabs();
   while (mode === "bridge") {
+    // Cheap, and it is the only thing that repairs a page whose content script
+    // went missing: ask the tabs to check themselves on every poll.
+    sweepTabs();
     try {
       // A hung request must not stop the loop for good: abort it and retry.
       const controller = new AbortController();
@@ -289,8 +306,36 @@ async function openRemoteTab() {
   try { await chrome.tabs.update(tab.id, { autoDiscardable: false }); } catch (error) { /* older browser */ }
 }
 
+/* The toolbar button has two jobs. On Chromium it opens the link page that holds
+ * the Bluetooth connection. On Firefox there is no Web Bluetooth - and Firefox
+ * treats this add-on's site access as opt-in, so an add-on can be installed,
+ * enabled, running, and unable to touch a single page. Granting it takes a click
+ * from the user, and a click is precisely what permissions.request() requires:
+ * so on Firefox the button is the grant, and it says so in its title. */
+/* What the user has to grant on Firefox: every host the manifest declares, taken
+ * from the manifest itself so the two can never disagree - including the
+ * loopback origin the bridge listens on. */
+const SITE_ORIGINS = (chrome.runtime.getManifest().host_permissions || [])
+  .filter((origin) => /^(https?|wss?):\/\//.test(origin));
+
+async function onToolbarClick() {
+  const hasBluetooth = (chrome.runtime.getManifest().permissions || [])
+    .includes("bluetooth");
+  if (hasBluetooth) return openRemoteTab();
+  try {
+    const granted = await chrome.permissions.request({ origins: SITE_ORIGINS });
+    console.log(`ytm-bridge: site access ${granted ? "granted" : "declined"}`);
+    if (!granted) return;
+  } catch (error) {
+    console.log("ytm-bridge: could not ask for site access:", error.message);
+    return;
+  }
+  sweepTabs(true);              // inject straight away rather than at next reload
+  probeOnce();
+}
+
 if (chrome.action && chrome.action.onClicked) {
-  chrome.action.onClicked.addListener(openRemoteTab);
+  chrome.action.onClicked.addListener(onToolbarClick);
 }
 
 chrome.runtime.onStartup.addListener(pollLoop);

@@ -45,10 +45,17 @@ class BuildManifestTests(unittest.TestCase):
             length = len(build.build_manifest(self.base, target)["description"])
             self.assertLessEqual(length, 132, f"{target} description is {length} chars")
 
+    def test_firefox_keeps_a_button_because_access_is_opt_in_there(self):
+        # Firefox makes host permissions opt-in, and permissions.request() needs
+        # a user gesture - so without a button there is nothing for a user to
+        # click, and an installed add-on can silently be unable to read the page.
+        manifest = self.firefox()
+        self.assertIn("action", manifest)
+        self.assertIn("access", manifest["action"]["default_title"].lower())
+
     def test_firefox_drops_what_it_cannot_use(self):
         manifest = self.firefox()
         self.assertNotIn("bluetooth", manifest.get("permissions", []))
-        self.assertNotIn("action", manifest)
         self.assertEqual(manifest["background"], {"scripts": ["background.js"]})
         gecko = manifest["browser_specific_settings"]["gecko"]
         self.assertEqual(gecko["id"], "ytm-bridge@solhex.local")

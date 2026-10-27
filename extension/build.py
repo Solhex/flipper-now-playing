@@ -45,7 +45,13 @@ def build_manifest(base, target):
         # the three; the loopback bridge is the path there.
         manifest["permissions"] = [p for p in manifest.get("permissions", [])
                                    if p != "bluetooth"]
-        manifest.pop("action", None)
+        # The Web Bluetooth link page is Chromium-only, so it is not shipped...
+        # ...but the toolbar button is kept, because Firefox treats host
+        # permissions as opt-in: the add-on can be installed, enabled and unable
+        # to touch a single page, with nothing to click and no way to notice.
+        # permissions.request() only works from a user gesture, so this button's
+        # one job is to ask for that access.
+        manifest["action"] = {"default_title": "Grant site access (once)"}
         manifest.setdefault("browser_specific_settings", {}).setdefault(
             "gecko", {}).update({
                 "id": "ytm-bridge@solhex.local",
